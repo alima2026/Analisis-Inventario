@@ -6,13 +6,9 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
-
 st.set_page_config(page_title="Ali Inventory", layout="wide")
 
 
-# =========================================================
-# Utilidades
-# =========================================================
 def normalize_part(value) -> str:
     if pd.isna(value):
         return ""
@@ -53,10 +49,7 @@ def detect_brand(part_no: str, description: str = "") -> str:
         return "Kia/Hyundai"
 
     # BMW / MINI
-    if (
-        p.startswith(("11", "12", "13", "16", "17", "18", "31", "32", "33", "34", "51", "61", "64"))
-        and len(p) in [7, 11]
-    ):
+    if p.startswith(("11", "12", "13", "16", "17", "18", "31", "32", "33", "34", "51", "61", "64")) and len(p) in [7, 11]:
         return "BMW/MINI"
     if "BMW" in d or "MINI" in d:
         return "BMW/MINI"
@@ -109,12 +102,8 @@ def to_excel_bytes(sheets: dict) -> bytes:
     return output.getvalue()
 
 
-# =========================================================
-# Lectura de archivos
-# =========================================================
 def load_sales(uploaded_file) -> pd.DataFrame:
     df = pd.read_excel(uploaded_file, header=[0, 1])
-
     df.columns = [
         "part_no",
         "description",
@@ -135,7 +124,7 @@ def load_sales(uploaded_file) -> pd.DataFrame:
     df["part_no"] = df["part_no"].map(normalize_part)
     df["description"] = df["description"].astype(str).str.strip()
 
-    for col in [
+    numeric_cols = [
         "sales_units",
         "bonif_units",
         "net_units",
@@ -144,7 +133,8 @@ def load_sales(uploaded_file) -> pd.DataFrame:
         "sales_usd",
         "cost_uyu",
         "cost_usd",
-    ]:
+    ]
+    for col in numeric_cols:
         df[col] = safe_numeric(df[col])
 
     df = df[df["part_no"] != ""].copy()
@@ -152,7 +142,6 @@ def load_sales(uploaded_file) -> pd.DataFrame:
     df["avg_monthly_units"] = df["sales_units"] / 36.0
     df["avg_annual_units"] = df["sales_units"] / 3.0
     df["avg_monthly_sales_uyu"] = df["sales_uyu"] / 36.0
-
     return df
 
 
@@ -172,8 +161,7 @@ def load_inventory(uploaded_file) -> pd.DataFrame:
 
 
 def load_backorder(uploaded_file) -> pd.DataFrame:
-    df = pd.read_excel(uploaded_file)
-    df = df.copy()
+    df = pd.read_excel(uploaded_file).copy()
 
     part_col = "Buyer Part" if "Buyer Part" in df.columns else "Seller Part"
     desc_col = "Description" if "Description" in df.columns else None
@@ -181,13 +169,14 @@ def load_backorder(uploaded_file) -> pd.DataFrame:
     df["part_no"] = df[part_col].map(normalize_part)
     df["description"] = df[desc_col].astype(str).str.strip() if desc_col else ""
 
-    for col in [
+    qty_cols = [
         "Under Investigation Qty",
         "Expected First Allocation Qty",
         "Expected Last Allocation Qty",
         "Allocation Qty",
         "Seller Part Qty",
-    ]:
+    ]
+    for col in qty_cols:
         if col in df.columns:
             df[col] = safe_numeric(df[col])
 
@@ -208,8 +197,7 @@ def load_backorder(uploaded_file) -> pd.DataFrame:
 
 
 def load_monthly_order(uploaded_file) -> pd.DataFrame:
-    df = pd.read_excel(uploaded_file)
-    df = df.copy()
+    df = pd.read_excel(uploaded_file).copy()
 
     part_col = "PART NO" if "PART NO" in df.columns else df.columns[0]
     qty_col = "PCS" if "PCS" in df.columns else df.columns[1]
@@ -221,15 +209,7 @@ def load_monthly_order(uploaded_file) -> pd.DataFrame:
     return df.groupby("part_no", as_index=False)["monthly_order_qty"].sum()
 
 
-# =========================================================
-# Motor principal
-# =========================================================
-def merge_all(
-    sales: pd.DataFrame,
-    stock: pd.DataFrame,
-    bo: pd.DataFrame,
-    order: pd.DataFrame,
-) -> pd.DataFrame:
+def merge_all(sales: pd.DataFrame, stock: pd.DataFrame, bo: pd.DataFrame, order: pd.DataFrame) -> pd.DataFrame:
     base = sales[
         [
             "part_no",
@@ -252,15 +232,12 @@ def merge_all(
 
     merged["part_no"] = merged["part_no"].fillna("").map(normalize_part)
     merged["description"] = merged["description"].fillna("")
-
     merged["brand"] = merged.apply(
-        lambda r: r["brand"]
-        if pd.notna(r["brand"]) and str(r["brand"]).strip() != ""
-        else detect_brand(r["part_no"], r["description"]),
+        lambda r: r["brand"] if pd.notna(r["brand"]) and str(r["brand"]).strip() != "" else detect_brand(r["part_no"], r["description"]),
         axis=1,
     )
 
-    for col in [
+    fill_zero_cols = [
         "sales_units",
         "sales_uyu",
         "cost_uyu",
@@ -270,15 +247,14 @@ def merge_all(
         "stock",
         "backorder_qty",
         "monthly_order_qty",
-    ]:
+    ]
+    for col in fill_zero_cols:
         merged[col] = merged[col].fillna(0)
 
     merged["pipeline_qty"] = merged["backorder_qty"] + merged["monthly_order_qty"]
     merged["available_plus_pipeline"] = merged["stock"] + merged["pipeline_qty"]
-
     merged["unit_margin_uyu"] = (
-        (merged["sales_uyu"] - merged["cost_uyu"])
-        / merged["sales_units"].replace(0, pd.NA)
+        (merged["sales_uyu"] - merged["cost_uyu"]) / merged["sales_units"].replace(0, pd.NA)
     )
     merged["unit_margin_uyu"] = merged["unit_margin_uyu"].fillna(0)
 
@@ -293,7 +269,6 @@ def add_inventory_logic(df: pd.DataFrame, target_months: int, lead_time_months: 
 
     out["target_stock_qty"] = (out["avg_monthly_units"] * target_months).apply(math.ceil)
     out["lead_time_need_qty"] = (out["avg_monthly_units"] * lead_time_months).apply(math.ceil)
-
     out["suggested_order_qty"] = (
         out["target_stock_qty"] - out["available_plus_pipeline"]
     ).clip(lower=0).apply(math.ceil)
@@ -312,16 +287,13 @@ def add_inventory_logic(df: pd.DataFrame, target_months: int, lead_time_months: 
         return "OK"
 
     out["status"] = out.apply(define_status, axis=1)
-
     out["stock_muerto"] = (out["stock"] > 0) & (out["sales_units"] <= 0)
-
     out["oferta_sugerida"] = (
         (out["stock"] > 0)
         & (out["sales_units"] > 0)
         & (out["months_of_stock"] >= 24)
         & (out["months_of_stock"] <= 30)
     )
-
     return out
 
 
@@ -409,9 +381,7 @@ def add_intelligent_order(df: pd.DataFrame, capital: float) -> pd.DataFrame:
     candidates["selected_for_purchase"] = candidates["intelligent_buy_qty"] > 0
 
     out = out.merge(
-        candidates[
-            ["part_no", "intelligent_buy_qty", "intelligent_buy_cost", "selected_for_purchase"]
-        ],
+        candidates[["part_no", "intelligent_buy_qty", "intelligent_buy_cost", "selected_for_purchase"]],
         on="part_no",
         how="left",
     )
@@ -423,9 +393,6 @@ def add_intelligent_order(df: pd.DataFrame, capital: float) -> pd.DataFrame:
     return out
 
 
-# =========================================================
-# Interfaz
-# =========================================================
 st.title("Ali Inventory")
 st.caption("Pedido inteligente, ABC, stock muerto y ofertas")
 
@@ -440,4 +407,248 @@ if st.session_state.empresa_seleccionada is None:
         st.rerun()
     st.stop()
 
-empresa_activa = st.session_state
+empresa_activa = st.session_state.empresa_seleccionada
+
+info_col, btn_col = st.columns([4, 1])
+info_col.success(f"Empresa activa: {empresa_activa}")
+if btn_col.button("Cambiar empresa"):
+    st.session_state.empresa_seleccionada = None
+    st.rerun()
+
+with st.sidebar:
+    st.header("Parámetros")
+    target_months = st.slider("Cobertura objetivo (meses)", 1, 24, 6)
+    lead_time_months = st.slider("Lead time (meses)", 1, 12, 6)
+    capital_available = st.number_input("Capital disponible (UYU)", min_value=0.0, value=500000.0, step=50000.0)
+    top_n = st.slider("Top productos", 5, 50, 20)
+
+st.subheader("Cargar archivos")
+up1, up2 = st.columns(2)
+ventas_file = up1.file_uploader("Ventas 3 años", type=["xls", "xlsx"])
+inventario_file = up2.file_uploader("Inventario", type=["xls", "xlsx"])
+up3, up4 = st.columns(2)
+backorder_file = up3.file_uploader("Backorder", type=["xls", "xlsx"])
+pedido_file = up4.file_uploader("Pedido mensual", type=["xls", "xlsx"])
+
+if not all([ventas_file, inventario_file, backorder_file, pedido_file]):
+    st.info("Subí los 4 archivos para comenzar el análisis.")
+    st.stop()
+
+try:
+    sales_df = load_sales(ventas_file)
+    stock_df = load_inventory(inventario_file)
+    bo_df = load_backorder(backorder_file)
+    order_df = load_monthly_order(pedido_file)
+
+    final_df = merge_all(sales_df, stock_df, bo_df, order_df)
+    final_df = add_inventory_logic(final_df, target_months, lead_time_months)
+    final_df = add_abc(final_df)
+    final_df = add_intelligent_order(final_df, capital_available)
+    final_df["empresa"] = empresa_activa
+
+except Exception as e:
+    st.error(f"Error procesando archivos: {e}")
+    st.stop()
+
+brand_options = ["Todos"] + sorted(final_df["brand"].dropna().unique().tolist())
+status_options = ["Todos"] + sorted(final_df["status"].dropna().unique().tolist())
+abc_options = ["Todos", "A", "B", "C"]
+
+f1, f2, f3, f4 = st.columns(4)
+selected_brand = f1.selectbox("Marca", brand_options)
+selected_status = f2.selectbox("Estado", status_options)
+selected_abc = f3.selectbox("ABC", abc_options)
+search_text = f4.text_input("Buscar código o descripción")
+
+view = final_df.copy()
+if selected_brand != "Todos":
+    view = view[view["brand"] == selected_brand]
+if selected_status != "Todos":
+    view = view[view["status"] == selected_status]
+if selected_abc != "Todos":
+    view = view[view["abc"] == selected_abc]
+if search_text:
+    term = search_text.strip().upper()
+    view = view[
+        view["part_no"].astype(str).str.upper().str.contains(term, na=False)
+        | view["description"].astype(str).str.upper().str.contains(term, na=False)
+    ]
+
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Ítems", f"{len(view):,}")
+k2.metric("Stock muerto", f"{int(view['stock_muerto'].sum()):,}")
+k3.metric("Ofertas sugeridas", f"{int(view['oferta_sugerida'].sum()):,}")
+k4.metric("Compra sugerida", f"{int(view['suggested_order_qty'].sum()):,}")
+k5.metric("Compra inteligente", f"{int(view['intelligent_buy_qty'].sum()):,}")
+
+st.subheader("Resumen por marca")
+summary_brand = (
+    view.groupby("brand", as_index=False)
+    .agg(
+        items=("part_no", "count"),
+        ventas_3y=("sales_units", "sum"),
+        stock=("stock", "sum"),
+        sugerido=("suggested_order_qty", "sum"),
+        compra_inteligente=("intelligent_buy_qty", "sum"),
+    )
+    .sort_values("ventas_3y", ascending=False)
+)
+st.dataframe(summary_brand, use_container_width=True)
+
+st.subheader("Resumen ABC")
+summary_abc = (
+    view.groupby("abc", as_index=False)
+    .agg(
+        items=("part_no", "count"),
+        ventas_uyu=("sales_uyu", "sum"),
+        stock=("stock", "sum"),
+        sugerido=("suggested_order_qty", "sum"),
+    )
+    .sort_values("abc")
+)
+st.dataframe(summary_abc, use_container_width=True)
+
+st.subheader("Top productos por ventas")
+top_sales = view.sort_values("sales_units", ascending=False).head(top_n)
+st.dataframe(
+    top_sales[
+        [
+            "empresa",
+            "part_no",
+            "description",
+            "brand",
+            "sales_units",
+            "stock",
+            "months_of_stock",
+            "abc",
+            "status",
+        ]
+    ],
+    use_container_width=True,
+)
+
+fig, ax = plt.subplots(figsize=(10, 5))
+plot_df = top_sales.head(15)
+ax.bar(plot_df["part_no"], plot_df["sales_units"])
+ax.set_title("Top 15 por unidades vendidas")
+ax.set_xlabel("Código")
+ax.set_ylabel("Unidades")
+ax.tick_params(axis="x", rotation=60)
+fig.tight_layout()
+st.pyplot(fig)
+
+st.subheader("Pedido inteligente")
+pedido_inteligente = view[view["selected_for_purchase"]].copy()
+pedido_inteligente = pedido_inteligente.sort_values(
+    ["smart_score", "intelligent_buy_cost"],
+    ascending=[False, False],
+)
+st.dataframe(
+    pedido_inteligente[
+        [
+            "empresa",
+            "part_no",
+            "description",
+            "brand",
+            "abc",
+            "status",
+            "stock",
+            "backorder_qty",
+            "monthly_order_qty",
+            "suggested_order_qty",
+            "intelligent_buy_qty",
+            "estimated_unit_cost",
+            "intelligent_buy_cost",
+            "estimated_gross_profit",
+            "smart_score",
+        ]
+    ],
+    use_container_width=True,
+    height=450,
+)
+
+st.subheader("Stock muerto")
+stock_muerto_df = view[view["stock_muerto"]].copy()
+st.dataframe(
+    stock_muerto_df[["empresa", "part_no", "description", "brand", "stock", "months_of_stock"]],
+    use_container_width=True,
+    height=300,
+)
+
+st.subheader("Ofertas sugeridas")
+ofertas_df = view[view["oferta_sugerida"]].copy()
+st.dataframe(
+    ofertas_df[
+        [
+            "empresa",
+            "part_no",
+            "description",
+            "brand",
+            "stock",
+            "months_of_stock",
+            "sales_units",
+            "abc",
+        ]
+    ],
+    use_container_width=True,
+    height=300,
+)
+
+st.subheader("Detalle completo")
+detail_cols = [
+    "empresa",
+    "part_no",
+    "description",
+    "brand",
+    "sales_units",
+    "sales_uyu",
+    "cost_uyu",
+    "avg_monthly_units",
+    "avg_annual_units",
+    "stock",
+    "backorder_qty",
+    "monthly_order_qty",
+    "pipeline_qty",
+    "available_plus_pipeline",
+    "months_of_stock",
+    "target_stock_qty",
+    "lead_time_need_qty",
+    "suggested_order_qty",
+    "abc",
+    "status",
+    "stock_muerto",
+    "oferta_sugerida",
+    "unit_margin_uyu",
+    "estimated_unit_cost",
+    "estimated_purchase_cost",
+    "estimated_gross_profit",
+    "abc_score",
+    "status_score",
+    "rotation_score",
+    "margin_score",
+    "smart_score",
+    "intelligent_buy_qty",
+    "intelligent_buy_cost",
+    "selected_for_purchase",
+]
+st.dataframe(view[detail_cols], use_container_width=True, height=500)
+
+excel_bytes = to_excel_bytes(
+    {
+        "pedido_inteligente": pedido_inteligente[detail_cols],
+        "stock_muerto": stock_muerto_df[detail_cols],
+        "ofertas": ofertas_df[detail_cols],
+        "resumen_marca": summary_brand,
+        "resumen_abc": summary_abc,
+        "detalle_completo": view[detail_cols],
+    }
+)
+
+st.download_button(
+    "Descargar análisis en Excel",
+    data=excel_bytes,
+    file_name="ali_inventory_resultado.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+
+st.success("Análisis completo generado correctamente.")
