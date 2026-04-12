@@ -1,14 +1,14 @@
 import math
 import os
 import re
-from io import BytesIO
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
 
-st.set_page_config(page_title="Ali Inventory - Pedido Inteligente", layout="wide")
+st.set_page_config(page_title="Ali Inventory - Reposición", layout="wide")
 
 DEFAULT_SALES = "/mnt/data/ventas_de_3años.xls"
 DEFAULT_STOCK = "/mnt/data/inventario_19032026.xls"
@@ -16,6 +16,9 @@ DEFAULT_BACKORDER = "/mnt/data/backorder.xls"
 DEFAULT_ORDER = "/mnt/data/HCCA.xlsx"
 
 
+# =========================
+# Utilidades
+# =========================
 def normalize_part(value) -> str:
     if pd.isna(value):
         return ""
@@ -25,38 +28,75 @@ def normalize_part(value) -> str:
     return text
 
 
-
 def safe_numeric(series: pd.Series) -> pd.Series:
     cleaned = (
         series.astype(str)
         .str.replace(".", "", regex=False)
         .str.replace(",", ".", regex=False)
         .str.replace(" ", "", regex=False)
-        .str.replace("$", "", regex=False)
-        .str.replace("U$S", "", regex=False)
-        .str.replace("UYU", "", regex=False)
     )
     return pd.to_numeric(cleaned, errors="coerce").fillna(0)
 
 
-
 def detect_brand(part_no: str, description: str = "") -> str:
     p = normalize_part(part_no)
-    d = str(description).upper()
+    d = str(description).upper().strip()
 
+    # -------------------------
+    # Reglas Mazda
+    # Ejemplos:
+    # B631-14-302A
+    # 0000-0000A
+    # -------------------------
+    if re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{2}-[A-Z0-9]{3}[A-Z]?", p):
+        return "Mazda"
+    if re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{4}[A-Z]?", p):
+        return "Mazda"
+
+    # -------------------------
+    # Reglas Kia / Hyundai
+    # Ejemplos:
+    # 77004E500
+    # 555133N100
+    # -------------------------
+    if re.fullmatch(r"[0-9]{5}[A-Z][0-9]{3}", p):
+        return "Kia/Hyundai"
+    if re.fullmatch(r"[0-9]{6}[A-Z][0-9]{3}", p):
+        return "Kia/Hyundai"
+
+    # -------------------------
+    # Multimarca / Alimatico
+    # Ejemplos:
+    # ATA.MICRO
+    # A20-32
+    # ACIM026
+    # WL7070
+    # -------------------------
+    if "." in p:
+        return "Multimarca"
+    if re.fullmatch(r"[A-Z]{1,4}[0-9]{2,6}[A-Z0-9-]*", p):
+        return "Multimarca"
+    if re.fullmatch(r"[A-Z0-9]{1,5}-[A-Z0-9]{1,5}", p):
+        return "Multimarca"
+
+    # Reglas antiguas de apoyo
     if p.startswith(("PE", "B6", "KD", "DG", "D0", "PA", "N2", "N3", "BJS", "BLD", "GJ", "GH")):
         return "Mazda"
     if p.startswith(("263", "319", "0K", "OK", "495", "517", "528", "546", "58", "86", "97", "HY")):
         return "Kia/Hyundai"
+
     if "MAZDA" in d:
         return "Mazda"
     if "KIA" in d or "HYUNDAI" in d:
         return "Kia/Hyundai"
-    return "Otros"
+
+    return "Multimarca"
 
 
-
-def load_sales(path) -> pd.DataFrame:
+# =========================
+# Carga de archivos exactos del usuario
+# =========================
+def load_sales(path: str) -> pd.DataFrame:
     df = pd.read_excel(path, header=[0, 1])
     df.columns = [
         "part_no", "description", "unit", "sales_units", "bonif_units", "net_units",
@@ -65,23 +105,16 @@ def load_sales(path) -> pd.DataFrame:
     df = df.copy()
     df["part_no"] = df["part_no"].map(normalize_part)
     df["description"] = df["description"].astype(str).str.strip()
-
     for col in ["sales_units", "bonif_units", "net_units", "sample_units", "sales_uyu", "sales_usd", "cost_uyu", "cost_usd"]:
         df[col] = safe_numeric(df[col])
-
     df = df[df["part_no"] != ""].copy()
     df["brand"] = df.apply(lambda r: detect_brand(r["part_no"], r["description"]), axis=1)
     df["avg_monthly_units"] = df["sales_units"] / 36.0
     df["avg_annual_units"] = df["sales_units"] / 3.0
-    df["avg_monthly_sales_uyu"] = df["sales_uyu"] / 36.0
-    df["unit_cost_uyu"] = (df["cost_uyu"] / df["sales_units"].replace(0, pd.NA)).fillna(0)
-    df["unit_sale_uyu"] = (df["sales_uyu"] / df["sales_units"].replace(0, pd.NA)).fillna(0)
-    df["unit_margin_uyu"] = (df["unit_sale_uyu"] - df["unit_cost_uyu"]).fillna(0)
     return df
 
 
-
-def load_inventory(path) -> pd.DataFrame:
+def load_inventory(path: str) -> pd.DataFrame:
     raw = pd.read_excel(path, header=None)
     df = raw.iloc[5:, [2, 8, 16, 20]].copy()
     df.columns = ["part_no", "description", "unit", "stock"]
@@ -94,112 +127,86 @@ def load_inventory(path) -> pd.DataFrame:
     return df.groupby(["part_no", "description", "brand"], as_index=False)["stock"].sum()
 
 
-
-def load_backorder(path) -> pd.DataFrame:
+def load_backorder(path: str) -> pd.DataFrame:
     df = pd.read_excel(path)
+    df = df.copy()
     part_col = "Buyer Part" if "Buyer Part" in df.columns else "Seller Part"
     df["part_no"] = df[part_col].map(normalize_part)
     df["description"] = df.get("Description", "").astype(str).str.strip()
 
-    qty_cols = [
+    for col in [
         "Under Investigation Qty",
         "Expected First Allocation Qty",
         "Expected Last Allocation Qty",
         "Allocation Qty",
-    ]
-    for col in qty_cols:
+        "Seller Part Qty",
+    ]:
         if col in df.columns:
             df[col] = safe_numeric(df[col])
 
     df["backorder_qty"] = 0
-    for col in qty_cols:
-        if col in df.columns:
-            df["backorder_qty"] += df[col]
+    if "Under Investigation Qty" in df.columns:
+        df["backorder_qty"] += df["Under Investigation Qty"]
+    if "Expected First Allocation Qty" in df.columns:
+        df["backorder_qty"] += df["Expected First Allocation Qty"]
+    if "Expected Last Allocation Qty" in df.columns:
+        df["backorder_qty"] += df["Expected Last Allocation Qty"]
+    if "Allocation Qty" in df.columns:
+        df["backorder_qty"] += df["Allocation Qty"]
 
     df["brand"] = df.apply(lambda r: detect_brand(r["part_no"], r["description"]), axis=1)
-    return df.groupby(["part_no", "description", "brand"], as_index=False)["backorder_qty"].sum()
+    out = df.groupby(["part_no", "description", "brand"], as_index=False)["backorder_qty"].sum()
+    return out
 
 
-
-def load_monthly_order(path) -> pd.DataFrame:
+def load_monthly_order(path: str) -> pd.DataFrame:
     df = pd.read_excel(path)
+    df = df.copy()
     df["part_no"] = df["PART NO"].map(normalize_part)
     df["monthly_order_qty"] = safe_numeric(df["PCS"])
     df["brand"] = df["part_no"].map(lambda x: detect_brand(x, ""))
-    return df.groupby(["part_no", "brand"], as_index=False)["monthly_order_qty"].sum()
-
+    out = df.groupby(["part_no", "brand"], as_index=False)["monthly_order_qty"].sum()
+    return out
 
 
 def merge_all(sales: pd.DataFrame, stock: pd.DataFrame, bo: pd.DataFrame, order: pd.DataFrame) -> pd.DataFrame:
     base = sales[[
         "part_no", "description", "brand", "sales_units", "sales_uyu", "cost_uyu",
-        "avg_monthly_units", "avg_annual_units", "avg_monthly_sales_uyu",
-        "unit_cost_uyu", "unit_sale_uyu", "unit_margin_uyu"
+        "avg_monthly_units", "avg_annual_units"
     ]].copy()
 
-    merged = (
-        base.merge(stock[["part_no", "stock"]], on="part_no", how="outer")
-            .merge(bo[["part_no", "backorder_qty"]], on="part_no", how="left")
-            .merge(order[["part_no", "monthly_order_qty"]], on="part_no", how="left")
+    merged = base.merge(
+        stock[["part_no", "stock"]], on="part_no", how="left"
+    ).merge(
+        bo[["part_no", "backorder_qty"]], on="part_no", how="left"
+    ).merge(
+        order[["part_no", "monthly_order_qty"]], on="part_no", how="left"
     )
 
-    merged["description"] = merged["description"].fillna("")
-    merged["brand"] = merged.apply(
-        lambda r: r["brand"] if pd.notna(r["brand"]) else detect_brand(r["part_no"], r["description"]), axis=1
-    )
-    for col in [
-        "sales_units", "sales_uyu", "cost_uyu", "avg_monthly_units", "avg_annual_units",
-        "avg_monthly_sales_uyu", "unit_cost_uyu", "unit_sale_uyu", "unit_margin_uyu",
-        "stock", "backorder_qty", "monthly_order_qty"
-    ]:
-        merged[col] = merged[col].fillna(0)
-
+    merged["stock"] = merged["stock"].fillna(0)
+    merged["backorder_qty"] = merged["backorder_qty"].fillna(0)
+    merged["monthly_order_qty"] = merged["monthly_order_qty"].fillna(0)
     merged["pipeline_qty"] = merged["backorder_qty"] + merged["monthly_order_qty"]
     merged["available_plus_pipeline"] = merged["stock"] + merged["pipeline_qty"]
-    return merged
+    merged["unit_margin_uyu"] = (merged["sales_uyu"] - merged["cost_uyu"]) / merged["sales_units"].replace(0, pd.NA)
+    merged["unit_margin_uyu"] = merged["unit_margin_uyu"].fillna(0)
+        return merged
 
 
-
-def apply_abc(df: pd.DataFrame, basis: str = "sales_uyu") -> pd.DataFrame:
-    out = df.copy().sort_values(basis, ascending=False).reset_index(drop=True)
-    total = out[basis].sum()
-    if total <= 0:
-        out["abc"] = "C"
-        out["abc_cum_pct"] = 0.0
-        return out
-
-    out["abc_cum_pct"] = out[basis].cumsum() / total
-
-    def classify(x):
-        if x <= 0.80:
-            return "A"
-        if x <= 0.95:
-            return "B"
-        return "C"
-
-    out["abc"] = out["abc_cum_pct"].apply(classify)
-    return out
-
-
-
-def add_logic(df: pd.DataFrame, target_months: int, lead_time_months: int) -> pd.DataFrame:
+def add_replenishment_logic(df: pd.DataFrame, target_months: int, lead_time_months: int) -> pd.DataFrame:
     out = df.copy()
     out["months_of_stock"] = out["stock"] / out["avg_monthly_units"].replace(0, pd.NA)
     out["months_of_stock"] = out["months_of_stock"].fillna(999)
-    out["years_of_stock"] = out["months_of_stock"] / 12.0
-
     out["target_stock_qty"] = (out["avg_monthly_units"] * target_months).apply(math.ceil)
     out["lead_time_need_qty"] = (out["avg_monthly_units"] * lead_time_months).apply(math.ceil)
-    out["suggested_monthly_order_qty"] = (
-        out["target_stock_qty"] - out["available_plus_pipeline"]
-    ).clip(lower=0).apply(math.ceil)
+    out["suggested_order_qty"] = (out["target_stock_qty"] - out["available_plus_pipeline"]).clip(lower=0).apply(math.ceil)
 
-    def classify_status(row):
-        if row["sales_units"] <= 0 and row["stock"] > 0:
-            return "Stock muerto"
+    def classify(row):
+        if row["avg_monthly_units"] <= 0 and row["stock"] > 0:
+            return "Sin venta / revisar"
         if row["avg_monthly_units"] <= 0 and row["stock"] <= 0:
             return "Sin historial"
-        if row["available_plus_pipeline"] <= 0 and row["avg_monthly_units"] > 0:
+        if row["available_plus_pipeline"] <= 0:
             return "Crítico"
         if row["available_plus_pipeline"] < row["lead_time_need_qty"]:
             return "Comprar ya"
@@ -207,293 +214,165 @@ def add_logic(df: pd.DataFrame, target_months: int, lead_time_months: int) -> pd
             return "Comprar"
         return "OK"
 
-    out["status"] = out.apply(classify_status, axis=1)
-    out["dead_stock_flag"] = ((out["sales_units"] <= 0) & (out["stock"] > 0))
-    out["offer_flag"] = (
-        (out["years_of_stock"] >= 2.0)
-        & (out["years_of_stock"] <= 2.5)
-        & (out["sales_units"] > 0)
-        & (out["stock"] > 0)
-    )
-    out["offer_suggestion"] = out["offer_flag"].map({True: "Sugerir oferta / promoción", False: ""})
-
-    urgency_map = {"Crítico": 100, "Comprar ya": 80, "Comprar": 50, "OK": 15, "Stock muerto": 0, "Sin historial": 5}
-    abc_map = {"A": 100, "B": 60, "C": 25}
-
-    out["urgency_score"] = out["status"].map(urgency_map).fillna(0)
-    out["abc_score"] = out["abc"].map(abc_map).fillna(0)
-
-    max_sales = max(float(out["avg_monthly_sales_uyu"].max()), 1.0)
-    max_margin = max(float(out["unit_margin_uyu"].clip(lower=0).max()), 1.0)
-
-    out["demand_score"] = (out["avg_monthly_sales_uyu"].clip(lower=0) / max_sales) * 100
-    out["margin_score"] = (out["unit_margin_uyu"].clip(lower=0) / max_margin) * 100
-
-    out["estimated_purchase_cost"] = out["suggested_monthly_order_qty"] * out["unit_cost_uyu"]
-    out["estimated_gross_profit"] = out["suggested_monthly_order_qty"] * out["unit_margin_uyu"]
-
-    out["smart_score"] = (
-        out["urgency_score"] * 0.40
-        + out["abc_score"] * 0.25
-        + out["demand_score"] * 0.20
-        + out["margin_score"] * 0.15
-    )
-
-    out.loc[out["dead_stock_flag"], "smart_score"] = 0
-    out.loc[out["suggested_monthly_order_qty"] <= 0, "smart_score"] = 0
-
-    out["score_per_cost"] = out["smart_score"] / out["unit_cost_uyu"].replace(0, pd.NA)
-    out["score_per_cost"] = out["score_per_cost"].fillna(out["smart_score"])
-
+    out["status"] = out.apply(classify, axis=1)
     return out
 
 
-
-def build_intelligent_order(df: pd.DataFrame, budget_uyu: float, allow_partial: bool = True) -> pd.DataFrame:
-    candidates = df[
-        (df["suggested_monthly_order_qty"] > 0)
-        & (~df["dead_stock_flag"])
-        & (df["unit_cost_uyu"] > 0)
-        & (df["smart_score"] > 0)
-    ].copy()
-
-    candidates = candidates.sort_values(
-        ["status", "abc", "score_per_cost", "smart_score", "avg_monthly_sales_uyu"],
-        ascending=[True, True, False, False, False],
-        key=lambda col: col.map({"Crítico": 0, "Comprar ya": 1, "Comprar": 2, "OK": 3}).fillna(col) if col.name == "status" else col
-    )
-
-    remaining = float(budget_uyu)
-    chosen_rows = []
-
-    for _, row in candidates.iterrows():
-        row = row.copy()
-        full_qty = int(max(row["suggested_monthly_order_qty"], 0))
-        unit_cost = float(max(row["unit_cost_uyu"], 0))
-        if full_qty <= 0 or unit_cost <= 0:
-            continue
-
-        max_affordable_qty = int(remaining // unit_cost) if unit_cost > 0 else 0
-        buy_qty = 0
-
-        if remaining >= full_qty * unit_cost:
-            buy_qty = full_qty
-        elif allow_partial and max_affordable_qty > 0:
-            buy_qty = min(full_qty, max_affordable_qty)
-
-        if buy_qty <= 0:
-            continue
-
-        row["recommended_buy_qty"] = int(buy_qty)
-        row["recommended_buy_cost"] = float(buy_qty * unit_cost)
-        row["recommended_buy_profit"] = float(buy_qty * row["unit_margin_uyu"])
-        row["remaining_budget_after"] = float(remaining - row["recommended_buy_cost"])
-        chosen_rows.append(row)
-        remaining -= row["recommended_buy_cost"]
-
-        if remaining <= 0:
-            break
-
-    if not chosen_rows:
-        return pd.DataFrame(columns=list(candidates.columns) + [
-            "recommended_buy_qty", "recommended_buy_cost", "recommended_buy_profit", "remaining_budget_after"
-        ])
-
-    return pd.DataFrame(chosen_rows)
-
-
-
-def to_excel_bytes(sheets: dict) -> bytes:
+def to_excel_bytes(df_detail: pd.DataFrame, df_summary: pd.DataFrame) -> bytes:
+    from io import BytesIO
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for sheet_name, df in sheets.items():
-            df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+        df_detail.to_excel(writer, sheet_name="detalle", index=False)
+        df_summary.to_excel(writer, sheet_name="resumen", index=False)
     return output.getvalue()
 
 
-st.title("Ali Inventory - Pedido inteligente")
-st.caption("Prioriza qué comprar primero según rotación, ABC, urgencia, margen y capital disponible")
+# =========================
+# UI
+# =========================
+st.title("Ali Inventory - Reposición inteligente")
+st.caption("Integra ventas 3 años + inventario + backorder + pedido mensual")
+
+# Selección inicial de empresa
+if "empresa_seleccionada" not in st.session_state:
+    st.session_state.empresa_seleccionada = None
+
+if st.session_state.empresa_seleccionada is None:
+    st.subheader("Seleccioná la empresa para consultar")
+    empresa_inicio = st.radio(
+        "Empresa",
+        ["Magna", "Alimatico SRL"],
+        horizontal=True,
+    )
+    if st.button("Continuar"):
+        st.session_state.empresa_seleccionada = empresa_inicio
+        st.rerun()
+    st.stop()
+
+empresa_activa = st.session_state.empresa_seleccionada
+
+col_empresa_a, col_empresa_b = st.columns([3, 1])
+col_empresa_a.info(f"Empresa activa: {empresa_activa}")
+if col_empresa_b.button("Cambiar empresa"):
+    st.session_state.empresa_seleccionada = None
+    st.rerun()
 
 with st.sidebar:
     st.header("Parámetros")
-    target_months = st.slider("Cobertura objetivo", 1, 12, 6)
-    lead_time_months = st.slider("Lead time importación", 1, 12, 6)
-    abc_basis = st.selectbox("ABC según", ["sales_uyu", "sales_units"], index=0)
-    budget_uyu = st.number_input("Capital disponible para comprar (UYU)", min_value=0.0, value=500000.0, step=50000.0)
-    allow_partial = st.checkbox("Permitir compra parcial si no alcanza el capital", value=True)
-    top_n = st.slider("Top filas", 10, 100, 30)
+    target_months = st.slider("Cobertura objetivo (meses)", 1, 12, 6)
+    lead_time_months = st.slider("Lead time / demora (meses)", 1, 12, 6)
+    top_n = st.slider("Top productos", 5, 50, 20)
+    st.markdown("---")
+    st.write("El sistema intenta usar tus archivos cargados automáticamente.")
+
+
+def file_exists(path: str) -> bool:
+    return os.path.exists(path)
 
 sales_path = DEFAULT_SALES
 stock_path = DEFAULT_STOCK
 bo_path = DEFAULT_BACKORDER
 order_path = DEFAULT_ORDER
 
-missing = [p for p in [sales_path, stock_path, bo_path, order_path] if not os.path.exists(p)]
-if missing:
-    st.warning("Faltan archivos por defecto. Subilos manualmente.")
-    sales_path = st.file_uploader("Ventas 3 años", type=["xls", "xlsx"])
-    stock_path = st.file_uploader("Inventario", type=["xls", "xlsx"])
-    bo_path = st.file_uploader("Backorder", type=["xls", "xlsx"])
-    order_path = st.file_uploader("Pedido mensual", type=["xls", "xlsx"])
-    if not all([sales_path, stock_path, bo_path, order_path]):
+if not all(file_exists(p) for p in [sales_path, stock_path, bo_path, order_path]):
+    st.warning("Faltan uno o más archivos por defecto. Subilos manualmente.")
+    up_sales = st.file_uploader("Ventas 3 años", type=["xls", "xlsx"], key="sales")
+    up_stock = st.file_uploader("Inventario", type=["xls", "xlsx"], key="stock")
+    up_bo = st.file_uploader("Backorder", type=["xls", "xlsx"], key="bo")
+    up_order = st.file_uploader("Pedido mensual", type=["xls", "xlsx"], key="order")
+    if not all([up_sales, up_stock, up_bo, up_order]):
         st.stop()
+    sales_path, stock_path, bo_path, order_path = up_sales, up_stock, up_bo, up_order
 
 try:
     sales_df = load_sales(sales_path)
     stock_df = load_inventory(stock_path)
     bo_df = load_backorder(bo_path)
     order_df = load_monthly_order(order_path)
-
     merged = merge_all(sales_df, stock_df, bo_df, order_df)
-    merged = apply_abc(merged, basis=abc_basis)
-    final_df = add_logic(merged, target_months, lead_time_months)
-    smart_order = build_intelligent_order(final_df, budget_uyu=budget_uyu, allow_partial=allow_partial)
+    final_df = add_replenishment_logic(merged, target_months, lead_time_months)
 except Exception as e:
-    st.error(f"No pude procesar los archivos: {e}")
+    st.error(f"Error procesando archivos: {e}")
     st.stop()
 
 brand_options = ["Todos"] + sorted(final_df["brand"].dropna().unique().tolist())
-abc_options = ["Todos"] + sorted(final_df["abc"].dropna().unique().tolist())
 status_options = ["Todos"] + sorted(final_df["status"].dropna().unique().tolist())
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3 = st.columns(3)
 selected_brand = c1.selectbox("Marca", brand_options)
-selected_abc = c2.selectbox("ABC", abc_options)
-selected_status = c3.selectbox("Estado", status_options)
-search_text = c4.text_input("Buscar código o descripción")
+selected_status = c2.selectbox("Estado", status_options)
+search_part = c3.text_input("Buscar código o descripción")
 
 view = final_df.copy()
+view["empresa"] = empresa_activa
 if selected_brand != "Todos":
     view = view[view["brand"] == selected_brand]
-if selected_abc != "Todos":
-    view = view[view["abc"] == selected_abc]
 if selected_status != "Todos":
     view = view[view["status"] == selected_status]
-if search_text:
-    term = search_text.strip().upper()
+if search_part:
+    term = search_part.strip().upper()
     view = view[
         view["part_no"].str.contains(term, na=False)
         | view["description"].str.upper().str.contains(term, na=False)
     ]
 
-smart_view = smart_order.copy()
-if selected_brand != "Todos":
-    smart_view = smart_view[smart_view["brand"] == selected_brand]
-if selected_abc != "Todos":
-    smart_view = smart_view[smart_view["abc"] == selected_abc]
-if selected_status != "Todos":
-    smart_view = smart_view[smart_view["status"] == selected_status]
-if search_text:
-    term = search_text.strip().upper()
-    smart_view = smart_view[
-        smart_view["part_no"].str.contains(term, na=False)
-        | smart_view["description"].str.upper().str.contains(term, na=False)
-    ]
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Ítems analizados", f"{len(view):,}")
+k2.metric("Comprar ya", f"{(view['status'] == 'Comprar ya').sum():,}")
+k3.metric("Compra sugerida total", f"{int(view['suggested_order_qty'].sum()):,}")
+k4.metric("Stock total", f"{int(view['stock'].sum()):,}")
 
-capital_used = float(smart_order["recommended_buy_cost"].sum()) if not smart_order.empty else 0.0
-capital_left = float(budget_uyu - capital_used)
-estimated_profit = float(smart_order["recommended_buy_profit"].sum()) if not smart_order.empty else 0.0
-
-k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Capital disponible", f"{budget_uyu:,.0f}")
-k2.metric("Capital asignado", f"{capital_used:,.0f}")
-k3.metric("Capital restante", f"{capital_left:,.0f}")
-k4.metric("Ganancia bruta estimada", f"{estimated_profit:,.0f}")
-k5.metric("Ítems elegidos", f"{len(smart_order):,}")
-
-st.subheader("Pedido inteligente recomendado")
-smart_cols = [
-    "part_no", "description", "brand", "abc", "status", "smart_score", "score_per_cost",
-    "sales_units", "avg_monthly_units", "stock", "backorder_qty", "monthly_order_qty",
-    "suggested_monthly_order_qty", "recommended_buy_qty", "unit_cost_uyu", "unit_margin_uyu",
-    "recommended_buy_cost", "recommended_buy_profit", "remaining_budget_after"
-]
-if smart_view.empty:
-    st.info("Con el capital actual no se pudo armar una compra sugerida. Probá subir el presupuesto o permitir compra parcial.")
-else:
-    st.dataframe(
-        smart_view[smart_cols].sort_values(["smart_score", "recommended_buy_cost"], ascending=[False, False]),
-        use_container_width=True,
-        height=450,
-    )
-
-st.subheader("Resumen ABC")
-abc_summary = (
-    view.groupby("abc", as_index=False)
+st.subheader("Resumen por estado")
+summary = (
+    view.groupby("status", as_index=False)
     .agg(
         items=("part_no", "count"),
-        ventas_3y=("sales_units", "sum"),
-        ventas_uyu=("sales_uyu", "sum"),
         stock=("stock", "sum"),
-        sugerido=("suggested_monthly_order_qty", "sum"),
+        pipeline=("pipeline_qty", "sum"),
+        sugerido=("suggested_order_qty", "sum"),
+        ventas_3y=("sales_units", "sum"),
     )
-    .sort_values("abc")
+    .sort_values("sugerido", ascending=False)
 )
-st.dataframe(abc_summary, use_container_width=True)
+st.dataframe(summary, use_container_width=True)
 
-st.subheader("Mercadería en stock clasificada ABC")
-stock_abc = view[view["stock"] > 0].copy().sort_values(["abc", "sales_uyu"], ascending=[True, False])
-stock_cols = ["part_no", "description", "brand", "abc", "stock", "sales_units", "sales_uyu", "years_of_stock", "status"]
-st.dataframe(stock_abc[stock_cols], use_container_width=True, height=350)
+st.subheader("Top repuestos por ventas (3 años)")
+top_sales = view.sort_values("sales_units", ascending=False).head(top_n)[[
+    "part_no", "description", "brand", "sales_units", "avg_monthly_units", "stock", "pipeline_qty", "months_of_stock", "status"
+]]
+st.dataframe(top_sales, use_container_width=True)
 
-st.subheader("Stock muerto")
-dead_stock = view[view["dead_stock_flag"]].copy().sort_values("stock", ascending=False)
-dead_cols = ["part_no", "description", "brand", "stock", "sales_units", "sales_uyu", "abc", "status"]
-st.dataframe(dead_stock[dead_cols], use_container_width=True, height=250)
-
-st.subheader("Sugerencia de ofertas (2 a 2,5 años de stock)")
-offer_df = view[view["offer_flag"]].copy().sort_values(["years_of_stock", "stock"], ascending=[False, False])
-offer_cols = ["part_no", "description", "brand", "abc", "stock", "sales_units", "avg_monthly_units", "years_of_stock", "offer_suggestion"]
-st.dataframe(offer_df[offer_cols], use_container_width=True, height=250)
-
-st.subheader("Top compra inteligente")
 fig1, ax1 = plt.subplots(figsize=(10, 5))
-plot_df = smart_order.sort_values("recommended_buy_cost", ascending=False).head(15)
-if not plot_df.empty:
-    ax1.bar(plot_df["part_no"], plot_df["recommended_buy_cost"])
-    ax1.set_xlabel("Código")
-    ax1.set_ylabel("Costo de compra sugerido (UYU)")
-    ax1.set_title("Top 15 compra sugerida por costo")
-    ax1.tick_params(axis="x", rotation=60)
-    fig1.tight_layout()
-    st.pyplot(fig1)
-else:
-    st.info("No hay datos para graficar en la compra inteligente.")
+ax1.bar(top_sales["part_no"].head(15), top_sales["sales_units"].head(15))
+ax1.set_title("Top 15 por unidades vendidas en 3 años")
+ax1.set_xlabel("Código")
+ax1.set_ylabel("Unidades")
+ax1.tick_params(axis="x", rotation=60)
+fig1.tight_layout()
+st.pyplot(fig1)
 
-st.subheader("Top ventas")
-top_sales = view.sort_values("sales_uyu", ascending=False).head(top_n)
-fig2, ax2 = plt.subplots(figsize=(10, 5))
-ax2.bar(top_sales["part_no"].head(15), top_sales["sales_uyu"].head(15))
-ax2.set_xlabel("Código")
-ax2.set_ylabel("Ventas UYU 3 años")
-ax2.set_title("Top 15 por ventas")
-ax2.tick_params(axis="x", rotation=60)
-fig2.tight_layout()
-st.pyplot(fig2)
-
-export_detail_cols = [
-    "part_no", "description", "brand", "abc", "status", "sales_units", "sales_uyu", "avg_monthly_units",
-    "stock", "backorder_qty", "monthly_order_qty", "pipeline_qty", "available_plus_pipeline",
-    "target_stock_qty", "suggested_monthly_order_qty", "unit_cost_uyu", "unit_margin_uyu",
-    "estimated_purchase_cost", "estimated_gross_profit", "smart_score", "score_per_cost",
-    "years_of_stock", "offer_suggestion"
+st.subheader("Repuestos para comprar ya")
+urgent = view[view["status"].isin(["Crítico", "Comprar ya", "Comprar"])].copy()
+urgent = urgent.sort_values(["status", "suggested_order_qty", "sales_units"], ascending=[True, False, False])
+show_cols = [
+    "empresa", "part_no", "description", "brand", "sales_units", "avg_monthly_units", "stock",
+    "backorder_qty", "monthly_order_qty", "available_plus_pipeline",
+    "target_stock_qty", "suggested_order_qty", "months_of_stock", "status"
 ]
+st.dataframe(urgent[show_cols], use_container_width=True, height=500)
+
+st.subheader("Detalle completo")
+st.dataframe(view[show_cols + ["sales_uyu", "cost_uyu", "unit_margin_uyu"]], use_container_width=True, height=500)
 
 excel_bytes = to_excel_bytes(
-    {
-        "pedido_inteligente": smart_order[smart_cols] if not smart_order.empty else pd.DataFrame(columns=smart_cols),
-        "resumen_abc": abc_summary,
-        "stock_abc": stock_abc[stock_cols],
-        "stock_muerto": dead_stock[dead_cols],
-        "ofertas": offer_df[offer_cols],
-        "detalle_completo": view[export_detail_cols],
-    }
+    view[show_cols + ["sales_uyu", "cost_uyu", "unit_margin_uyu"]],
+    summary,
 )
 st.download_button(
-    "Descargar análisis completo",
+    "Descargar análisis en Excel",
     data=excel_bytes,
-    file_name="ali_inventory_pedido_inteligente.xlsx",
+    file_name="ali_inventory_reposicion.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
-st.success("Listo. Ahora tenés compra inteligente con capital limitado, ABC, stock muerto y ofertas sugeridas.")
+st.success("Listo. El próximo paso es agregar ranking ABC, stock muerto y sugerencia de pedido eficiente por proveedor.")
