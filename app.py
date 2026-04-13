@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Ali Inventory", layout="wide")
+st.set_page_config(page_title="IA-Control Pedidos", layout="wide")
 
 
 # =========================================================
