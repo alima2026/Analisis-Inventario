@@ -1,41 +1,60 @@
-# Ali Inventory
+# 🚀 Ali Inventory JIT
 
-Sistema inteligente de análisis y gestión de repuestos (Mazda, Kia y multimarca).
-
-## 🚀 Funcionalidades
-
-- 📊 Análisis de ventas (3 años)
-- 📦 Integración con inventario
-- 🚚 Backorder + pedidos en tránsito
-- 🧠 Clasificación ABC automática
-- 💀 Detección de stock muerto
-- 🔥 Sugerencia de ofertas (2 a 2.5 años de stock)
-- 📈 Pedido mensual sugerido
-- ⚠ Alertas de reposición
+Sistema inteligente de gestión de inventario para repuestos automotrices con enfoque **JIT (Just In Time)**, optimización de compras y control de pedidos en tránsito.
 
 ---
 
-## 🧠 Lógica del sistema
+## 🧠 ¿Qué hace este sistema?
 
-### 📊 Clasificación ABC
-- A → 80% de las ventas
-- B → 80% a 95%
-- C → 95% a 100%
+Ali Inventory analiza:
 
-### 💀 Stock muerto
-- Productos con stock
-- Sin ventas en los últimos 3 años
+- Ventas históricas (3 años)
+- Inventario actual
+- Backorder
+- Pedidos mensuales
+- Pedidos emitidos (base de datos)
 
-### 🔥 Ofertas sugeridas
-- Productos con cobertura entre 24 y 30 meses
+Y genera automáticamente:
 
-### 📦 Pedido mensual
-- Basado en consumo promedio mensual
-- Ajustado por stock actual + backorder + pedidos
+- 📊 Clasificación ABC
+- 📦 Pedido inteligente optimizado
+- ⚠️ Alertas de reposición
+- 💀 Stock muerto
+- 🔥 Ofertas sugeridas
+- 🚛 Control de pedidos en tránsito (clave JIT)
 
 ---
 
-## ⚙️ Instalación
+## 🏢 Empresas soportadas
 
-```bash
-pip install -r requirements.txt
+Al iniciar, elegís:
+
+- **Magna**
+  - Mazda
+  - Kia / Hyundai
+  - BMW / MINI
+  - Multimarca
+
+- **Alimatico SRL**
+  - Multimarca completa
+
+---
+
+## 🔍 Clasificación automática por código
+
+El sistema detecta la marca automáticamente:
+
+| Tipo | Ejemplo |
+|------|--------|
+| Mazda | B631-14-302A |
+| Kia | 77004E500 |
+| BMW | 11238511371 |
+| Multimarca | ATA.MICRO |
+
+---
+
+## ⚙️ Lógica JIT (CORE DEL SISTEMA)
+
+El sistema calcula:
+
+### 📈 Consumo
