@@ -22,7 +22,7 @@ st.markdown(
             background-color: #f6f8fb;
         }
         .block-container {
-            padding-top: 1.5rem;
+            padding-top: 1.2rem;
             padding-bottom: 2rem;
         }
         h1, h2, h3 {
@@ -36,10 +36,6 @@ st.markdown(
             border: 1px solid #eef1f6;
             margin-bottom: 1rem;
         }
-        .small-muted {
-            color: #6b7280;
-            font-size: 0.95rem;
-        }
         .menu-title {
             font-size: 1.05rem;
             font-weight: 700;
@@ -52,6 +48,49 @@ st.markdown(
             color: #1f2a44;
             margin-top: 0.2rem;
             margin-bottom: 0.8rem;
+        }
+        .hero-box {
+            background: linear-gradient(135deg, #ffffff 0%, #f3f8ff 100%);
+            border: 1px solid #e5edf7;
+            border-radius: 22px;
+            padding: 1.2rem 1.4rem;
+            box-shadow: 0 6px 18px rgba(0,0,0,0.05);
+            margin-bottom: 1rem;
+        }
+        .hero-title {
+            font-size: 2.2rem;
+            font-weight: 800;
+            color: #1f2a44;
+            margin-bottom: 0.2rem;
+        }
+        .hero-subtitle {
+            color: #6b7280;
+            font-size: 1rem;
+        }
+        section[data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #f8fafc 0%, #eef4ff 100%);
+            border-right: 1px solid #dbe4f0;
+        }
+        section[data-testid="stSidebar"] .stButton > button {
+            border-radius: 14px;
+            border: 1px solid #d9e2ec;
+            background: white;
+            color: #1f2a44;
+            font-weight: 600;
+            padding: 0.7rem 0.8rem;
+            margin-bottom: 0.35rem;
+            text-align: left;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+        }
+        section[data-testid="stSidebar"] .stButton > button:hover {
+            border-color: #93c5fd;
+            background: #eff6ff;
+            color: #0f172a;
+        }
+        section[data-testid="stSidebar"] .stSlider label,
+        section[data-testid="stSidebar"] .stNumberInput label {
+            font-weight: 600;
+            color: #334155;
         }
     </style>
     """,
@@ -87,14 +126,12 @@ def detect_brand(part_no: str, description: str = "") -> str:
     d = str(description).upper().strip()
 
     # MAZDA
-    # Ej: B631-14-302A / 0000-0000A
     if re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{2}-[A-Z0-9]{3}[A-Z]?", p):
         return "Mazda"
     if re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{4}[A-Z]?", p):
         return "Mazda"
 
     # KIA / HYUNDAI
-    # Ej: 77004E500 / 555133N100
     if re.fullmatch(r"[0-9]{5}[A-Z][0-9]{3}", p):
         return "Kia/Hyundai"
     if re.fullmatch(r"[0-9]{6}[A-Z][0-9]{3}", p):
@@ -107,7 +144,6 @@ def detect_brand(part_no: str, description: str = "") -> str:
         return "BMW/MINI"
 
     # MULTIMARCA
-    # Ej: ATA.MICRO / A20-32 / ACIM026 / WL7070
     if "." in p:
         return "Multimarca"
     if re.fullmatch(r"[A-Z]{1,6}[0-9]{2,6}[A-Z0-9-]*", p):
@@ -454,8 +490,15 @@ def add_intelligent_order(df: pd.DataFrame, capital: float) -> pd.DataFrame:
 # =========================================================
 # HEADER
 # =========================================================
-st.title("Ali Inventory")
-st.caption("Pedido inteligente, ABC, stock muerto y ofertas")
+st.markdown(
+    """
+    <div class="hero-box">
+        <div class="hero-title">Ali Inventory</div>
+        <div class="hero-subtitle">Pedido inteligente, ABC, stock muerto y ofertas</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # =========================================================
 # SELECCIÓN INICIAL DE EMPRESA
@@ -484,10 +527,10 @@ with top_btn_col:
         st.rerun()
 
 # =========================================================
-# SIDEBAR
+# SIDEBAR CON MENÚ PREMIUM
 # =========================================================
 with st.sidebar:
-    st.markdown('<div class="menu-title">Parámetros</div>', unsafe_allow_html=True)
+    st.markdown("## ⚙️ Parámetros")
     target_months = st.slider("Cobertura objetivo (meses)", 1, 24, 6)
     lead_time_months = st.slider("Lead time (meses)", 1, 12, 6)
     capital_available = st.number_input(
@@ -499,20 +542,38 @@ with st.sidebar:
     top_n = st.slider("Top productos", 5, 50, 20)
 
     st.markdown("---")
-    st.markdown('<div class="menu-title">Menú</div>', unsafe_allow_html=True)
-    menu = st.radio(
-        "Ir a",
-        [
-            "Dashboard",
-            "Pedido Inteligente",
-            "Stock Muerto",
-            "Ofertas",
-            "ABC",
-            "Top Ventas",
-            "Detalle Completo",
-        ],
-        label_visibility="collapsed",
-    )
+    st.markdown("## 📂 Navegación")
+
+    if "menu" not in st.session_state:
+        st.session_state.menu = "Dashboard"
+
+    menu_labels = {
+        "Dashboard": "📊 Dashboard",
+        "Pedido Inteligente": "📦 Pedido Inteligente",
+        "Stock Muerto": "💀 Stock Muerto",
+        "Ofertas": "🔥 Ofertas",
+        "ABC": "🧠 ABC",
+        "Top Ventas": "📈 Top Ventas",
+        "Detalle Completo": "📋 Detalle Completo",
+    }
+
+    menu_options = [
+        "Dashboard",
+        "Pedido Inteligente",
+        "Stock Muerto",
+        "Ofertas",
+        "ABC",
+        "Top Ventas",
+        "Detalle Completo",
+    ]
+
+    for option in menu_options:
+        active = st.session_state.menu == option
+        label = f"✅ {menu_labels[option]}" if active else menu_labels[option]
+        if st.button(label, use_container_width=True, key=f"menu_{option}"):
+            st.session_state.menu = option
+
+menu = st.session_state.menu
 
 # =========================================================
 # CARGA DE ARCHIVOS
@@ -665,6 +726,7 @@ k5.metric("Compra inteligente", f"{int(view['intelligent_buy_qty'].sum()):,}")
 if menu == "Dashboard":
     st.markdown('<div class="section-title">Dashboard</div>', unsafe_allow_html=True)
     c1, c2 = st.columns([1.2, 1])
+
     with c1:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.subheader("Resumen por marca")
