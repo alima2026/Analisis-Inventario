@@ -6,11 +6,86 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="IA-Control Pedidos", layout="wide")
+st.set_page_config(page_title="Ali Inventory", layout="wide", initial_sidebar_state="expanded")
 
 
 # =========================================================
-# Utilidades
+# ESTILO VISUAL
+# =========================================================
+st.markdown(
+    """
+    <style>
+        .main {
+            background-color: #f6f8fb;
+        }
+        .block-container {
+            padding-top: 1.2rem;
+            padding-bottom: 2rem;
+        }
+        h1, h2, h3 {
+            color: #1f2a44;
+        }
+        .hero-box {
+            background: linear-gradient(135deg, #ffffff 0%, #f3f8ff 100%);
+            border: 1px solid #e5edf7;
+            border-radius: 22px;
+            padding: 1.2rem 1.4rem;
+            box-shadow: 0 6px 18px rgba(0,0,0,0.05);
+            margin-bottom: 1rem;
+        }
+        .hero-title {
+            font-size: 2.2rem;
+            font-weight: 800;
+            color: #1f2a44;
+            margin-bottom: 0.2rem;
+        }
+        .hero-subtitle {
+            color: #6b7280;
+            font-size: 1rem;
+        }
+        .section-title {
+            font-size: 1.6rem;
+            font-weight: 700;
+            color: #1f2a44;
+            margin-top: 0.2rem;
+            margin-bottom: 0.8rem;
+        }
+        .card {
+            background: white;
+            padding: 1rem 1.2rem;
+            border-radius: 18px;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.06);
+            border: 1px solid #eef1f6;
+            margin-bottom: 1rem;
+        }
+        section[data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #f8fafc 0%, #eef4ff 100%);
+            border-right: 1px solid #dbe4f0;
+        }
+        section[data-testid="stSidebar"] .stButton > button {
+            border-radius: 14px;
+            border: 1px solid #d9e2ec;
+            background: white;
+            color: #1f2a44;
+            font-weight: 600;
+            padding: 0.7rem 0.8rem;
+            margin-bottom: 0.35rem;
+            text-align: left;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+        }
+        section[data-testid="stSidebar"] .stButton > button:hover {
+            border-color: #93c5fd;
+            background: #eff6ff;
+            color: #0f172a;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# =========================================================
+# UTILIDADES
 # =========================================================
 def normalize_part(value) -> str:
     if pd.isna(value):
@@ -44,25 +119,21 @@ def detect_brand(part_no: str, description: str = "") -> str:
     p = normalize_part(part_no)
     d = str(description).upper().strip()
 
-    # MAZDA
     if re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{2}-[A-Z0-9]{3}[A-Z]?", p):
         return "Mazda"
     if re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{4}[A-Z]?", p):
         return "Mazda"
 
-    # KIA / HYUNDAI
     if re.fullmatch(r"[0-9]{5}[A-Z][0-9]{3}", p):
         return "Kia/Hyundai"
     if re.fullmatch(r"[0-9]{6}[A-Z][0-9]{3}", p):
         return "Kia/Hyundai"
 
-    # BMW / MINI
     if p.startswith(("11", "12", "13", "16", "17", "18", "31", "32", "33", "34", "51", "61", "64")) and len(p) in [7, 11]:
         return "BMW/MINI"
     if "BMW" in d or "MINI" in d:
         return "BMW/MINI"
 
-    # MULTIMARCA
     if "." in p:
         return "Multimarca"
     if re.fullmatch(r"[A-Z]{1,6}[0-9]{2,6}[A-Z0-9-]*", p):
@@ -110,7 +181,7 @@ def to_excel_bytes(sheets: dict) -> bytes:
 
 
 # =========================================================
-# Lectura de archivos
+# LECTURA DE ARCHIVOS
 # =========================================================
 def load_sales(uploaded_file) -> pd.DataFrame:
     df = pd.read_excel(uploaded_file, header=[0, 1])
@@ -150,7 +221,6 @@ def load_sales(uploaded_file) -> pd.DataFrame:
     df = df[df["part_no"] != ""].copy()
     df["brand"] = df.apply(lambda r: detect_brand(r["part_no"], r["description"]), axis=1)
 
-    # Consolidar por código
     df = (
         df.groupby("part_no", as_index=False)
         .agg(
@@ -170,7 +240,6 @@ def load_sales(uploaded_file) -> pd.DataFrame:
     df["avg_monthly_units"] = df["sales_units"] / 36.0
     df["avg_annual_units"] = df["sales_units"] / 3.0
     df["avg_monthly_sales_uyu"] = df["sales_uyu"] / 36.0
-
     return df
 
 
@@ -251,12 +320,11 @@ def load_monthly_order(uploaded_file) -> pd.DataFrame:
     df["monthly_order_qty"] = safe_numeric(df[qty_col])
 
     df = df[df["part_no"] != ""].copy()
-
     return df.groupby("part_no", as_index=False)["monthly_order_qty"].sum()
 
 
 # =========================================================
-# Motor principal
+# MOTOR PRINCIPAL
 # =========================================================
 def merge_all(
     sales: pd.DataFrame,
@@ -272,7 +340,6 @@ def merge_all(
 
     merged["part_no"] = merged["part_no"].fillna("").map(normalize_part)
     merged["description"] = merged["description"].fillna("")
-
     merged["brand"] = merged.apply(
         lambda r: r["brand"] if pd.notna(r.get("brand")) and str(r.get("brand")).strip() != "" else detect_brand(r["part_no"], r["description"]),
         axis=1,
@@ -302,7 +369,6 @@ def merge_all(
         / merged["sales_units"].replace(0, pd.NA)
     ).fillna(0)
 
-    # Consolidación defensiva final
     merged = (
         merged.groupby("part_no", as_index=False)
         .agg(
@@ -352,7 +418,6 @@ def add_inventory_logic(df: pd.DataFrame, target_months: int, lead_time_months: 
         return "OK"
 
     out["status"] = out.apply(define_status, axis=1)
-
     out["stock_muerto"] = (out["stock"] > 0) & (out["sales_units"] <= 0)
     out["oferta_sugerida"] = (
         (out["stock"] > 0)
@@ -447,7 +512,6 @@ def add_intelligent_order(df: pd.DataFrame, capital: float) -> pd.DataFrame:
     candidates["intelligent_buy_cost"] = buy_cost
     candidates["selected_for_purchase"] = candidates["intelligent_buy_qty"] > 0
 
-    # NO volver a mergear smart_score porque ya existe en out
     out = out.merge(
         candidates[["part_no", "intelligent_buy_qty", "intelligent_buy_cost", "selected_for_purchase"]],
         on="part_no",
@@ -462,11 +526,21 @@ def add_intelligent_order(df: pd.DataFrame, capital: float) -> pd.DataFrame:
 
 
 # =========================================================
-# Interfaz
+# HEADER
 # =========================================================
-st.title("Ali Inventory")
-st.caption("Pedido inteligente, ABC, stock muerto y ofertas")
+st.markdown(
+    """
+    <div class="hero-box">
+        <div class="hero-title">Ali Inventory</div>
+        <div class="hero-subtitle">Pedido inteligente, ABC, stock muerto y ofertas</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
+# =========================================================
+# EMPRESA
+# =========================================================
 if "empresa_seleccionada" not in st.session_state:
     st.session_state.empresa_seleccionada = None
 
@@ -486,6 +560,9 @@ if btn_col.button("Cambiar empresa"):
     st.session_state.empresa_seleccionada = None
     st.rerun()
 
+# =========================================================
+# SIDEBAR + MENU
+# =========================================================
 with st.sidebar:
     st.header("Parámetros")
     target_months = st.slider("Cobertura objetivo (meses)", 1, 24, 6)
@@ -498,7 +575,35 @@ with st.sidebar:
     )
     top_n = st.slider("Top productos", 5, 50, 20)
 
-st.subheader("Cargar archivos")
+    st.markdown("---")
+    st.subheader("Menú")
+
+    if "menu" not in st.session_state:
+        st.session_state.menu = "Dashboard"
+
+    menu_labels = {
+        "Dashboard": "📊 Dashboard",
+        "Pedido Inteligente": "📦 Pedido Inteligente",
+        "Stock Muerto": "💀 Stock Muerto",
+        "Ofertas": "🔥 Ofertas",
+        "ABC": "🧠 ABC",
+        "Top Ventas": "📈 Top Ventas",
+        "Detalle Completo": "📋 Detalle Completo",
+    }
+
+    for option, label in menu_labels.items():
+        active = st.session_state.menu == option
+        btn_label = f"✅ {label}" if active else label
+        if st.button(btn_label, use_container_width=True, key=f"menu_{option}"):
+            st.session_state.menu = option
+
+menu = st.session_state.menu
+
+# =========================================================
+# ARCHIVOS
+# =========================================================
+st.markdown('<div class="section-title">Cargar archivos</div>', unsafe_allow_html=True)
+
 up1, up2 = st.columns(2)
 ventas_file = up1.file_uploader("Ventas 3 años", type=["xls", "xlsx"])
 inventario_file = up2.file_uploader("Inventario", type=["xls", "xlsx"])
@@ -526,6 +631,9 @@ except Exception as e:
     st.error(f"Error procesando archivos: {e}")
     st.stop()
 
+# =========================================================
+# FILTROS
+# =========================================================
 brand_options = ["Todos"] + sorted(final_df["brand"].dropna().unique().tolist())
 status_options = ["Todos"] + sorted(final_df["status"].dropna().unique().tolist())
 abc_options = ["Todos", "A", "B", "C"]
@@ -550,14 +658,9 @@ if search_text:
         | view["description"].astype(str).str.upper().str.contains(term, na=False)
     ]
 
-k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Ítems", f"{len(view):,}")
-k2.metric("Stock muerto", f"{int(view['stock_muerto'].sum()):,}")
-k3.metric("Ofertas sugeridas", f"{int(view['oferta_sugerida'].sum()):,}")
-k4.metric("Compra sugerida", f"{int(view['suggested_order_qty'].sum()):,}")
-k5.metric("Compra inteligente", f"{int(view['intelligent_buy_qty'].sum()):,}")
-
-st.subheader("Resumen por marca")
+# =========================================================
+# DATAFRAMES
+# =========================================================
 summary_brand = (
     view.groupby("brand", as_index=False)
     .agg(
@@ -569,9 +672,7 @@ summary_brand = (
     )
     .sort_values("ventas_3y", ascending=False)
 )
-st.dataframe(summary_brand, use_container_width=True)
 
-st.subheader("Resumen ABC")
 summary_abc = (
     view.groupby("abc", as_index=False)
     .agg(
@@ -582,96 +683,17 @@ summary_abc = (
     )
     .sort_values("abc")
 )
-st.dataframe(summary_abc, use_container_width=True)
 
-st.subheader("Top productos por ventas")
 top_sales = view.sort_values("sales_units", ascending=False).head(top_n)
-st.dataframe(
-    top_sales[
-        [
-            "empresa",
-            "part_no",
-            "description",
-            "brand",
-            "sales_units",
-            "stock",
-            "months_of_stock",
-            "abc",
-            "status",
-        ]
-    ],
-    use_container_width=True,
-)
 
-fig, ax = plt.subplots(figsize=(10, 5))
-plot_df = top_sales.head(15)
-ax.bar(plot_df["part_no"], plot_df["sales_units"])
-ax.set_title("Top 15 por unidades vendidas")
-ax.set_xlabel("Código")
-ax.set_ylabel("Unidades")
-ax.tick_params(axis="x", rotation=60)
-fig.tight_layout()
-st.pyplot(fig)
-
-st.subheader("Pedido inteligente")
 pedido_inteligente = view[view["selected_for_purchase"]].copy()
 pedido_inteligente = pedido_inteligente.sort_values(
     ["smart_score", "intelligent_buy_cost"], ascending=[False, False]
 )
-st.dataframe(
-    pedido_inteligente[
-        [
-            "empresa",
-            "part_no",
-            "description",
-            "brand",
-            "abc",
-            "status",
-            "stock",
-            "backorder_qty",
-            "monthly_order_qty",
-            "suggested_order_qty",
-            "intelligent_buy_qty",
-            "estimated_unit_cost",
-            "intelligent_buy_cost",
-            "estimated_gross_profit",
-            "smart_score",
-        ]
-    ],
-    use_container_width=True,
-    height=450,
-)
 
-st.subheader("Stock muerto")
 stock_muerto_df = view[view["stock_muerto"]].copy()
-st.dataframe(
-    stock_muerto_df[
-        ["empresa", "part_no", "description", "brand", "stock", "months_of_stock"]
-    ],
-    use_container_width=True,
-    height=300,
-)
-
-st.subheader("Ofertas sugeridas")
 ofertas_df = view[view["oferta_sugerida"]].copy()
-st.dataframe(
-    ofertas_df[
-        [
-            "empresa",
-            "part_no",
-            "description",
-            "brand",
-            "stock",
-            "months_of_stock",
-            "sales_units",
-            "abc",
-        ]
-    ],
-    use_container_width=True,
-    height=300,
-)
 
-st.subheader("Detalle completo")
 detail_cols = [
     "empresa",
     "part_no",
@@ -701,8 +723,160 @@ detail_cols = [
     "estimated_gross_profit",
     "smart_score",
 ]
-st.dataframe(view[detail_cols], use_container_width=True, height=500)
 
+# =========================================================
+# METRICAS
+# =========================================================
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Ítems", f"{len(view):,}")
+k2.metric("Stock muerto", f"{int(view['stock_muerto'].sum()):,}")
+k3.metric("Ofertas sugeridas", f"{int(view['oferta_sugerida'].sum()):,}")
+k4.metric("Compra sugerida", f"{int(view['suggested_order_qty'].sum()):,}")
+k5.metric("Compra inteligente", f"{int(view['intelligent_buy_qty'].sum()):,}")
+
+# =========================================================
+# SECCIONES DEL MENU
+# =========================================================
+if menu == "Dashboard":
+    st.markdown('<div class="section-title">Dashboard</div>', unsafe_allow_html=True)
+
+    c1, c2 = st.columns([1.2, 1])
+
+    with c1:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("Resumen por marca")
+        st.dataframe(summary_brand, use_container_width=True, height=280)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with c2:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("Resumen ABC")
+        st.dataframe(summary_abc, use_container_width=True, height=280)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("Top 15 por unidades vendidas")
+    plot_df = top_sales.head(15)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(plot_df["part_no"], plot_df["sales_units"])
+    ax.set_xlabel("Código")
+    ax.set_ylabel("Unidades")
+    ax.tick_params(axis="x", rotation=60)
+    fig.tight_layout()
+    st.pyplot(fig)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+elif menu == "Pedido Inteligente":
+    st.markdown('<div class="section-title">Pedido Inteligente</div>', unsafe_allow_html=True)
+    st.dataframe(
+        pedido_inteligente[
+            [
+                "empresa",
+                "part_no",
+                "description",
+                "brand",
+                "abc",
+                "status",
+                "stock",
+                "backorder_qty",
+                "monthly_order_qty",
+                "suggested_order_qty",
+                "intelligent_buy_qty",
+                "estimated_unit_cost",
+                "intelligent_buy_cost",
+                "estimated_gross_profit",
+                "smart_score",
+            ]
+        ],
+        use_container_width=True,
+        height=650,
+    )
+
+elif menu == "Stock Muerto":
+    st.markdown('<div class="section-title">Stock Muerto</div>', unsafe_allow_html=True)
+    st.dataframe(
+        stock_muerto_df[
+            ["empresa", "part_no", "description", "brand", "stock", "months_of_stock"]
+        ],
+        use_container_width=True,
+        height=650,
+    )
+
+elif menu == "Ofertas":
+    st.markdown('<div class="section-title">Ofertas Sugeridas</div>', unsafe_allow_html=True)
+    st.dataframe(
+        ofertas_df[
+            [
+                "empresa",
+                "part_no",
+                "description",
+                "brand",
+                "stock",
+                "months_of_stock",
+                "sales_units",
+                "abc",
+            ]
+        ],
+        use_container_width=True,
+        height=650,
+    )
+
+elif menu == "ABC":
+    st.markdown('<div class="section-title">Clasificación ABC</div>', unsafe_allow_html=True)
+    st.dataframe(
+        view[
+            [
+                "empresa",
+                "part_no",
+                "description",
+                "brand",
+                "sales_uyu",
+                "sales_units",
+                "abc",
+                "status",
+            ]
+        ].sort_values(["abc", "sales_uyu"], ascending=[True, False]),
+        use_container_width=True,
+        height=650,
+    )
+
+elif menu == "Top Ventas":
+    st.markdown('<div class="section-title">Top Productos por Ventas</div>', unsafe_allow_html=True)
+    st.dataframe(
+        top_sales[
+            [
+                "empresa",
+                "part_no",
+                "description",
+                "brand",
+                "sales_units",
+                "stock",
+                "months_of_stock",
+                "abc",
+                "status",
+            ]
+        ],
+        use_container_width=True,
+        height=500,
+    )
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    plot_df = top_sales.head(15)
+    ax.bar(plot_df["part_no"], plot_df["sales_units"])
+    ax.set_title("Top 15 por unidades vendidas")
+    ax.set_xlabel("Código")
+    ax.set_ylabel("Unidades")
+    ax.tick_params(axis="x", rotation=60)
+    fig.tight_layout()
+    st.pyplot(fig)
+
+elif menu == "Detalle Completo":
+    st.markdown('<div class="section-title">Detalle Completo</div>', unsafe_allow_html=True)
+    st.dataframe(view[detail_cols], use_container_width=True, height=650)
+
+# =========================================================
+# DESCARGA
+# =========================================================
 excel_bytes = to_excel_bytes(
     {
         "pedido_inteligente": pedido_inteligente[detail_cols] if not pedido_inteligente.empty else pd.DataFrame(columns=detail_cols),
