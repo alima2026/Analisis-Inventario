@@ -1,7 +1,3 @@
-# ===============================
-# ALI INVENTORY JIT - VERSION PRO
-# ===============================
-
 import math
 import re
 from io import BytesIO
@@ -10,210 +6,719 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Ali Inventory JIT", layout="wide")
+st.set_page_config(page_title="Ali Inventory", layout="wide")
+
 
 # =========================================================
-# UTILIDADES
+# Utilidades
 # =========================================================
-def normalize_part(value):
+def normalize_part(value) -> str:
     if pd.isna(value):
         return ""
-    return re.sub(r"\s+", "", str(value).upper().strip())
+    text = str(value).strip().upper()
+    text = re.sub(r"\s+", "", text)
+    return text
 
 
-def safe_numeric(series):
-    return pd.to_numeric(
-        series.astype(str)
-        .str.replace("$", "")
-        .str.replace(",", "")
-        .str.replace(" ", ""),
-        errors="coerce"
-    ).fillna(0)
+def safe_numeric(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.strip()
+
+    s = (
+        s.str.replace("$", "", regex=False)
+        .str.replace("USD", "", regex=False)
+        .str.replace("UYU", "", regex=False)
+        .str.replace(" ", "", regex=False)
+    )
+
+    mask_decimal_comma = s.str.contains(",", regex=False, na=False)
+    s.loc[mask_decimal_comma] = (
+        s.loc[mask_decimal_comma]
+        .str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+
+    return pd.to_numeric(s, errors="coerce").fillna(0)
 
 
-def detect_brand(part_no, desc=""):
+def detect_brand(part_no: str, description: str = "") -> str:
     p = normalize_part(part_no)
-    d = str(desc).upper()
+    d = str(description).upper().strip()
 
-    if re.match(r"[A-Z0-9]{4}-", p):
+    # MAZDA
+    if re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{2}-[A-Z0-9]{3}[A-Z]?", p):
         return "Mazda"
-    if re.match(r"\d{5}[A-Z]\d{3}", p):
-        return "Kia"
+    if re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{4}[A-Z]?", p):
+        return "Mazda"
+
+    # KIA / HYUNDAI
+    if re.fullmatch(r"[0-9]{5}[A-Z][0-9]{3}", p):
+        return "Kia/Hyundai"
+    if re.fullmatch(r"[0-9]{6}[A-Z][0-9]{3}", p):
+        return "Kia/Hyundai"
+
+    # BMW / MINI
+    if p.startswith(("11", "12", "13", "16", "17", "18", "31", "32", "33", "34", "51", "61", "64")) and len(p) in [7, 11]:
+        return "BMW/MINI"
+    if "BMW" in d or "MINI" in d:
+        return "BMW/MINI"
+
+    # MULTIMARCA
     if "." in p:
+        return "Multimarca"
+    if re.fullmatch(r"[A-Z]{1,6}[0-9]{2,6}[A-Z0-9-]*", p):
+        return "Multimarca"
+    if re.fullmatch(r"[A-Z0-9]{1,6}-[A-Z0-9]{1,6}", p):
         return "Multimarca"
 
     if "MAZDA" in d:
         return "Mazda"
-    if "KIA" in d:
-        return "Kia"
+    if "KIA" in d or "HYUNDAI" in d:
+        return "Kia/Hyundai"
 
     return "Multimarca"
 
 
-# =========================================================
-# LECTURA ARCHIVOS
-# =========================================================
-def load_sales(file):
-    df = pd.read_excel(file)
+def classify_abc(df: pd.DataFrame, value_col: str = "sales_uyu") -> pd.DataFrame:
+    abc = df.copy()
+    abc = abc.sort_values(value_col, ascending=False).reset_index(drop=True)
+    total_value = abc[value_col].sum()
 
-    df["part_no"] = df.iloc[:, 0].map(normalize_part)
-    df["description"] = df.iloc[:, 1]
-    df["sales_units"] = safe_numeric(df.iloc[:, 3])
-    df["sales_uyu"] = safe_numeric(df.iloc[:, 7])
-    df["cost_uyu"] = safe_numeric(df.iloc[:, 11])
+    if total_value <= 0:
+        abc["abc"] = "C"
+        return abc
 
+    abc["pct"] = abc[value_col] / total_value
+    abc["pct_acum"] = abc["pct"].cumsum()
+
+    def label(p):
+        if p <= 0.80:
+            return "A"
+        if p <= 0.95:
+            return "B"
+        return "C"
+
+    abc["abc"] = abc["pct_acum"].apply(label)
+    return abc
+
+
+def to_excel_bytes(sheets: dict) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for sheet_name, df in sheets.items():
+            df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+    return output.getvalue()
+
+
+# =========================================================
+# Lectura de archivos
+# =========================================================
+def load_sales(uploaded_file) -> pd.DataFrame:
+    df = pd.read_excel(uploaded_file, header=[0, 1])
+
+    df.columns = [
+        "part_no",
+        "description",
+        "unit",
+        "sales_units",
+        "bonif_units",
+        "net_units",
+        "sample_units",
+        "sales_uyu",
+        "sales_usd",
+        "sales_pct",
+        "cost_uyu",
+        "cost_usd",
+        "cost_pct",
+    ]
+
+    df = df.copy()
+    df["part_no"] = df["part_no"].map(normalize_part)
+    df["description"] = df["description"].astype(str).str.strip()
+
+    for col in [
+        "sales_units",
+        "bonif_units",
+        "net_units",
+        "sample_units",
+        "sales_uyu",
+        "sales_usd",
+        "cost_uyu",
+        "cost_usd",
+    ]:
+        df[col] = safe_numeric(df[col])
+
+    df = df[df["part_no"] != ""].copy()
     df["brand"] = df.apply(lambda r: detect_brand(r["part_no"], r["description"]), axis=1)
 
-    df["avg_monthly_units"] = df["sales_units"] / 36
+    # Consolidar por código
+    df = (
+        df.groupby("part_no", as_index=False)
+        .agg(
+            description=("description", "first"),
+            brand=("brand", "first"),
+            sales_units=("sales_units", "sum"),
+            bonif_units=("bonif_units", "sum"),
+            net_units=("net_units", "sum"),
+            sample_units=("sample_units", "sum"),
+            sales_uyu=("sales_uyu", "sum"),
+            sales_usd=("sales_usd", "sum"),
+            cost_uyu=("cost_uyu", "sum"),
+            cost_usd=("cost_usd", "sum"),
+        )
+    )
+
+    df["avg_monthly_units"] = df["sales_units"] / 36.0
+    df["avg_annual_units"] = df["sales_units"] / 3.0
+    df["avg_monthly_sales_uyu"] = df["sales_uyu"] / 36.0
 
     return df
 
 
-def load_inventory(file):
-    df = pd.read_excel(file)
+def load_inventory(uploaded_file) -> pd.DataFrame:
+    raw = pd.read_excel(uploaded_file, header=None)
+    df = raw.iloc[5:, [2, 8, 16, 20]].copy()
+    df.columns = ["part_no", "description", "unit", "stock"]
 
-    df["part_no"] = df.iloc[:, 0].map(normalize_part)
-    df["stock"] = safe_numeric(df.iloc[:, -1])
+    df = df.dropna(subset=["part_no"]).copy()
+    df["part_no"] = df["part_no"].map(normalize_part)
+    df["description"] = df["description"].astype(str).str.strip()
+    df["stock"] = safe_numeric(df["stock"])
 
-    return df.groupby("part_no", as_index=False)["stock"].sum()
+    df = df[df["part_no"] != ""].copy()
+    df["brand"] = df.apply(lambda r: detect_brand(r["part_no"], r["description"]), axis=1)
+
+    return (
+        df.groupby("part_no", as_index=False)
+        .agg(
+            description=("description", "first"),
+            brand=("brand", "first"),
+            stock=("stock", "sum"),
+        )
+    )
 
 
-def load_backorder(file):
-    df = pd.read_excel(file)
+def load_backorder(uploaded_file) -> pd.DataFrame:
+    df = pd.read_excel(uploaded_file).copy()
 
-    df["part_no"] = df.iloc[:, 0].map(normalize_part)
-    df["backorder_qty"] = safe_numeric(df.iloc[:, -1])
+    part_col = "Buyer Part" if "Buyer Part" in df.columns else df.columns[0]
+    desc_col = "Description" if "Description" in df.columns else None
 
-    return df.groupby("part_no", as_index=False)["backorder_qty"].sum()
+    df["part_no"] = df[part_col].map(normalize_part)
+    df["description"] = df[desc_col].astype(str).str.strip() if desc_col else ""
+
+    qty_cols = [
+        "Under Investigation Qty",
+        "Expected First Allocation Qty",
+        "Expected Last Allocation Qty",
+        "Allocation Qty",
+        "Seller Part Qty",
+    ]
+
+    for col in qty_cols:
+        if col in df.columns:
+            df[col] = safe_numeric(df[col])
+
+    df["backorder_qty"] = 0
+    for col in [
+        "Under Investigation Qty",
+        "Expected First Allocation Qty",
+        "Expected Last Allocation Qty",
+        "Allocation Qty",
+    ]:
+        if col in df.columns:
+            df["backorder_qty"] += df[col]
+
+    df = df[df["part_no"] != ""].copy()
+    df["brand"] = df.apply(lambda r: detect_brand(r["part_no"], r["description"]), axis=1)
+
+    return (
+        df.groupby("part_no", as_index=False)
+        .agg(
+            description=("description", "first"),
+            brand=("brand", "first"),
+            backorder_qty=("backorder_qty", "sum"),
+        )
+    )
 
 
-def load_orders(file):
-    df = pd.read_excel(file)
+def load_monthly_order(uploaded_file) -> pd.DataFrame:
+    df = pd.read_excel(uploaded_file).copy()
 
-    df["part_no"] = df.iloc[:, 0].map(normalize_part)
-    df["monthly_order_qty"] = safe_numeric(df.iloc[:, 1])
+    part_col = "PART NO" if "PART NO" in df.columns else df.columns[0]
+    qty_col = "PCS" if "PCS" in df.columns else df.columns[1]
+
+    df["part_no"] = df[part_col].map(normalize_part)
+    df["monthly_order_qty"] = safe_numeric(df[qty_col])
+
+    df = df[df["part_no"] != ""].copy()
 
     return df.groupby("part_no", as_index=False)["monthly_order_qty"].sum()
 
 
 # =========================================================
-# LOGICA PRINCIPAL
+# Motor principal
 # =========================================================
-def process_all(sales, stock, bo, orders):
+def merge_all(
+    sales: pd.DataFrame,
+    stock: pd.DataFrame,
+    bo: pd.DataFrame,
+    order: pd.DataFrame,
+) -> pd.DataFrame:
+    merged = sales.copy()
 
-    df = sales.merge(stock, on="part_no", how="left")
-    df = df.merge(bo, on="part_no", how="left")
-    df = df.merge(orders, on="part_no", how="left")
+    merged = merged.merge(stock[["part_no", "stock"]], on="part_no", how="outer")
+    merged = merged.merge(bo[["part_no", "backorder_qty"]], on="part_no", how="left")
+    merged = merged.merge(order[["part_no", "monthly_order_qty"]], on="part_no", how="left")
 
-    df.fillna(0, inplace=True)
+    merged["part_no"] = merged["part_no"].fillna("").map(normalize_part)
+    merged["description"] = merged["description"].fillna("")
 
-    df["pipeline"] = df["backorder_qty"] + df["monthly_order_qty"]
-    df["available"] = df["stock"] + df["pipeline"]
-
-    # -------------------------
-    # SMART SCORE (FIX ERROR)
-    # -------------------------
-    df["smart_score"] = (
-        df["avg_monthly_units"] * 1000
-        / (df["stock"] + 1)
+    merged["brand"] = merged.apply(
+        lambda r: r["brand"] if pd.notna(r.get("brand")) and str(r.get("brand")).strip() != "" else detect_brand(r["part_no"], r["description"]),
+        axis=1,
     )
 
-    # -------------------------
-    # ABC
-    # -------------------------
-    df = df.sort_values("sales_uyu", ascending=False)
-    df["acum"] = df["sales_uyu"].cumsum() / df["sales_uyu"].sum()
+    numeric_cols = [
+        "sales_units",
+        "sales_uyu",
+        "cost_uyu",
+        "avg_monthly_units",
+        "avg_annual_units",
+        "avg_monthly_sales_uyu",
+        "stock",
+        "backorder_qty",
+        "monthly_order_qty",
+    ]
+    for col in numeric_cols:
+        if col not in merged.columns:
+            merged[col] = 0
+        merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
 
-    df["abc"] = df["acum"].apply(
-        lambda x: "A" if x <= 0.8 else ("B" if x <= 0.95 else "C")
+    merged["pipeline_qty"] = merged["backorder_qty"] + merged["monthly_order_qty"]
+    merged["available_plus_pipeline"] = merged["stock"] + merged["pipeline_qty"]
+
+    merged["unit_margin_uyu"] = (
+        (merged["sales_uyu"] - merged["cost_uyu"])
+        / merged["sales_units"].replace(0, pd.NA)
+    ).fillna(0)
+
+    # Consolidación defensiva final
+    merged = (
+        merged.groupby("part_no", as_index=False)
+        .agg(
+            description=("description", "first"),
+            brand=("brand", "first"),
+            sales_units=("sales_units", "sum"),
+            sales_uyu=("sales_uyu", "sum"),
+            cost_uyu=("cost_uyu", "sum"),
+            avg_monthly_units=("avg_monthly_units", "sum"),
+            avg_annual_units=("avg_annual_units", "sum"),
+            avg_monthly_sales_uyu=("avg_monthly_sales_uyu", "sum"),
+            stock=("stock", "sum"),
+            backorder_qty=("backorder_qty", "sum"),
+            monthly_order_qty=("monthly_order_qty", "sum"),
+            pipeline_qty=("pipeline_qty", "sum"),
+            available_plus_pipeline=("available_plus_pipeline", "sum"),
+            unit_margin_uyu=("unit_margin_uyu", "sum"),
+        )
     )
 
-    return df
+    return merged
 
 
-def calculate_jit(df, meses_objetivo, lead_time):
+def add_inventory_logic(df: pd.DataFrame, target_months: int, lead_time_months: int) -> pd.DataFrame:
+    out = df.copy()
 
-    df["stock_meses"] = df["stock"] / df["avg_monthly_units"].replace(0, 1)
+    out["months_of_stock"] = out["stock"] / out["avg_monthly_units"].replace(0, pd.NA)
+    out["months_of_stock"] = out["months_of_stock"].fillna(999)
 
-    df["target_stock"] = df["avg_monthly_units"] * meses_objetivo
-    df["lead_stock"] = df["avg_monthly_units"] * lead_time
+    out["target_stock_qty"] = (out["avg_monthly_units"] * target_months).apply(math.ceil)
+    out["lead_time_need_qty"] = (out["avg_monthly_units"] * lead_time_months).apply(math.ceil)
+    out["suggested_order_qty"] = (
+        out["target_stock_qty"] - out["available_plus_pipeline"]
+    ).clip(lower=0).apply(math.ceil)
 
-    df["pedido_sugerido"] = (
-        df["target_stock"] - df["available"]
-    ).clip(lower=0)
+    def define_status(row):
+        if row["sales_units"] <= 0 and row["stock"] > 0:
+            return "Stock muerto"
+        if row["sales_units"] <= 0 and row["stock"] <= 0:
+            return "Sin historial"
+        if row["available_plus_pipeline"] <= 0:
+            return "Crítico"
+        if row["available_plus_pipeline"] < row["lead_time_need_qty"]:
+            return "Comprar ya"
+        if row["available_plus_pipeline"] < row["target_stock_qty"]:
+            return "Comprar"
+        return "OK"
 
-    df["status"] = df.apply(lambda r:
-        "Crítico" if r["available"] <= 0 else
-        "Comprar ya" if r["available"] < r["lead_stock"] else
-        "Comprar" if r["available"] < r["target_stock"] else
-        "OK"
-    , axis=1)
+    out["status"] = out.apply(define_status, axis=1)
 
-    return df
+    out["stock_muerto"] = (out["stock"] > 0) & (out["sales_units"] <= 0)
+    out["oferta_sugerida"] = (
+        (out["stock"] > 0)
+        & (out["sales_units"] > 0)
+        & (out["months_of_stock"] >= 24)
+        & (out["months_of_stock"] <= 30)
+    )
+
+    return out
+
+
+def add_abc(df: pd.DataFrame) -> pd.DataFrame:
+    abc_df = classify_abc(df[["part_no", "sales_uyu"]].copy(), value_col="sales_uyu")
+    out = df.merge(abc_df[["part_no", "abc"]], on="part_no", how="left")
+    out["abc"] = out["abc"].fillna("C")
+    return out
+
+
+def add_intelligent_order(df: pd.DataFrame, capital: float) -> pd.DataFrame:
+    out = df.copy()
+
+    abc_score = {"A": 100, "B": 70, "C": 40}
+    status_score = {
+        "Crítico": 100,
+        "Comprar ya": 80,
+        "Comprar": 60,
+        "OK": 20,
+        "Sin historial": 10,
+        "Stock muerto": 0,
+    }
+
+    out["abc_score"] = out["abc"].map(abc_score).fillna(40)
+    out["status_score"] = out["status"].map(status_score).fillna(20)
+    out["rotation_score"] = out["avg_monthly_units"].fillna(0) * 10
+    out["margin_score"] = out["unit_margin_uyu"].fillna(0) / 100
+
+    out["smart_score"] = (
+        out["abc_score"] * 0.35
+        + out["status_score"] * 0.35
+        + out["rotation_score"] * 0.20
+        + out["margin_score"] * 0.10
+    )
+
+    out["estimated_unit_cost"] = 0.0
+    mask_cost = out["sales_units"] > 0
+    out.loc[mask_cost, "estimated_unit_cost"] = (
+        out.loc[mask_cost, "cost_uyu"] / out.loc[mask_cost, "sales_units"]
+    )
+    out["estimated_unit_cost"] = out["estimated_unit_cost"].fillna(0)
+
+    out["estimated_purchase_cost"] = out["suggested_order_qty"] * out["estimated_unit_cost"]
+    out["estimated_gross_profit"] = out["suggested_order_qty"] * out["unit_margin_uyu"]
+
+    candidates = out[
+        (out["suggested_order_qty"] > 0)
+        & (~out["stock_muerto"])
+        & (out["estimated_unit_cost"] >= 0)
+    ].copy()
+
+    candidates = candidates.sort_values(
+        ["smart_score", "estimated_gross_profit", "sales_units"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+    remaining_capital = capital
+    buy_qty = []
+    buy_cost = []
+
+    for _, row in candidates.iterrows():
+        qty = int(row["suggested_order_qty"])
+        unit_cost = float(row["estimated_unit_cost"])
+
+        if qty <= 0:
+            buy_qty.append(0)
+            buy_cost.append(0.0)
+            continue
+
+        if unit_cost <= 0:
+            buy_qty.append(qty)
+            buy_cost.append(0.0)
+            continue
+
+        max_affordable = int(remaining_capital // unit_cost)
+        final_qty = min(qty, max_affordable)
+        final_cost = final_qty * unit_cost
+
+        buy_qty.append(final_qty)
+        buy_cost.append(final_cost)
+        remaining_capital -= final_cost
+
+    candidates["intelligent_buy_qty"] = buy_qty
+    candidates["intelligent_buy_cost"] = buy_cost
+    candidates["selected_for_purchase"] = candidates["intelligent_buy_qty"] > 0
+
+    # NO volver a mergear smart_score porque ya existe en out
+    out = out.merge(
+        candidates[["part_no", "intelligent_buy_qty", "intelligent_buy_cost", "selected_for_purchase"]],
+        on="part_no",
+        how="left",
+    )
+
+    out["intelligent_buy_qty"] = out["intelligent_buy_qty"].fillna(0)
+    out["intelligent_buy_cost"] = out["intelligent_buy_cost"].fillna(0)
+    out["selected_for_purchase"] = out["selected_for_purchase"].fillna(False)
+
+    return out
 
 
 # =========================================================
-# UI
+# Interfaz
 # =========================================================
-st.title("🚀 Ali Inventory JIT")
+st.title("Ali Inventory")
+st.caption("Pedido inteligente, ABC, stock muerto y ofertas")
 
-empresa = st.radio("Empresa", ["Magna", "Alimatico SRL"])
+if "empresa_seleccionada" not in st.session_state:
+    st.session_state.empresa_seleccionada = None
 
-col1, col2 = st.columns(2)
-
-ventas = col1.file_uploader("Ventas")
-inventario = col2.file_uploader("Inventario")
-
-backorder = col1.file_uploader("Backorder")
-pedido = col2.file_uploader("Pedidos")
-
-if not all([ventas, inventario, backorder, pedido]):
+if st.session_state.empresa_seleccionada is None:
+    st.subheader("Seleccioná la empresa para consultar")
+    empresa_inicio = st.radio("Empresa", ["Magna", "Alimatico SRL"], horizontal=True)
+    if st.button("Continuar"):
+        st.session_state.empresa_seleccionada = empresa_inicio
+        st.rerun()
     st.stop()
 
-# Parámetros
-meses = st.slider("Cobertura meses", 1, 12, 6)
-lead = st.slider("Lead time", 1, 12, 6)
+empresa_activa = st.session_state.empresa_seleccionada
 
-# Procesar
-sales_df = load_sales(ventas)
-stock_df = load_inventory(inventario)
-bo_df = load_backorder(backorder)
-order_df = load_orders(pedido)
+info_col, btn_col = st.columns([4, 1])
+info_col.success(f"Empresa activa: {empresa_activa}")
+if btn_col.button("Cambiar empresa"):
+    st.session_state.empresa_seleccionada = None
+    st.rerun()
 
-df = process_all(sales_df, stock_df, bo_df, order_df)
-df = calculate_jit(df, meses, lead)
+with st.sidebar:
+    st.header("Parámetros")
+    target_months = st.slider("Cobertura objetivo (meses)", 1, 24, 6)
+    lead_time_months = st.slider("Lead time (meses)", 1, 12, 6)
+    capital_available = st.number_input(
+        "Capital disponible (UYU)",
+        min_value=0.0,
+        value=500000.0,
+        step=50000.0,
+    )
+    top_n = st.slider("Top productos", 5, 50, 20)
 
-# =========================================================
-# RESULTADOS
-# =========================================================
-st.subheader("📊 KPIs")
+st.subheader("Cargar archivos")
+up1, up2 = st.columns(2)
+ventas_file = up1.file_uploader("Ventas 3 años", type=["xls", "xlsx"])
+inventario_file = up2.file_uploader("Inventario", type=["xls", "xlsx"])
+up3, up4 = st.columns(2)
+backorder_file = up3.file_uploader("Backorder", type=["xls", "xlsx"])
+pedido_file = up4.file_uploader("Pedido mensual", type=["xls", "xlsx"])
 
-c1, c2, c3 = st.columns(3)
-c1.metric("Items", len(df))
-c2.metric("Stock muerto", len(df[df["sales_units"] == 0]))
-c3.metric("Compra sugerida", int(df["pedido_sugerido"].sum()))
+if not all([ventas_file, inventario_file, backorder_file, pedido_file]):
+    st.info("Subí los 4 archivos para comenzar el análisis.")
+    st.stop()
 
-# TOP
-st.subheader("🔥 Top ventas")
-st.dataframe(df.sort_values("sales_units", ascending=False).head(20))
+try:
+    sales_df = load_sales(ventas_file)
+    stock_df = load_inventory(inventario_file)
+    bo_df = load_backorder(backorder_file)
+    order_df = load_monthly_order(pedido_file)
 
-# PEDIDO
-st.subheader("📦 Pedido inteligente")
+    final_df = merge_all(sales_df, stock_df, bo_df, order_df)
+    final_df = add_inventory_logic(final_df, target_months, lead_time_months)
+    final_df = add_abc(final_df)
+    final_df = add_intelligent_order(final_df, capital_available)
+    final_df["empresa"] = empresa_activa
 
-pedido_df = df[df["pedido_sugerido"] > 0]
-pedido_df = pedido_df.sort_values("smart_score", ascending=False)
+except Exception as e:
+    st.error(f"Error procesando archivos: {e}")
+    st.stop()
 
-st.dataframe(pedido_df[[
-    "part_no", "description", "brand",
-    "stock", "pipeline",
-    "pedido_sugerido", "status", "smart_score"
-]])
+brand_options = ["Todos"] + sorted(final_df["brand"].dropna().unique().tolist())
+status_options = ["Todos"] + sorted(final_df["status"].dropna().unique().tolist())
+abc_options = ["Todos", "A", "B", "C"]
 
-# GRAFICO
-fig, ax = plt.subplots()
-top = df.head(15)
-ax.bar(top["part_no"], top["sales_units"])
-plt.xticks(rotation=60)
+f1, f2, f3, f4 = st.columns(4)
+selected_brand = f1.selectbox("Marca", brand_options)
+selected_status = f2.selectbox("Estado", status_options)
+selected_abc = f3.selectbox("ABC", abc_options)
+search_text = f4.text_input("Buscar código o descripción")
+
+view = final_df.copy()
+if selected_brand != "Todos":
+    view = view[view["brand"] == selected_brand]
+if selected_status != "Todos":
+    view = view[view["status"] == selected_status]
+if selected_abc != "Todos":
+    view = view[view["abc"] == selected_abc]
+if search_text:
+    term = search_text.strip().upper()
+    view = view[
+        view["part_no"].astype(str).str.upper().str.contains(term, na=False)
+        | view["description"].astype(str).str.upper().str.contains(term, na=False)
+    ]
+
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Ítems", f"{len(view):,}")
+k2.metric("Stock muerto", f"{int(view['stock_muerto'].sum()):,}")
+k3.metric("Ofertas sugeridas", f"{int(view['oferta_sugerida'].sum()):,}")
+k4.metric("Compra sugerida", f"{int(view['suggested_order_qty'].sum()):,}")
+k5.metric("Compra inteligente", f"{int(view['intelligent_buy_qty'].sum()):,}")
+
+st.subheader("Resumen por marca")
+summary_brand = (
+    view.groupby("brand", as_index=False)
+    .agg(
+        items=("part_no", "count"),
+        ventas_3y=("sales_units", "sum"),
+        stock=("stock", "sum"),
+        sugerido=("suggested_order_qty", "sum"),
+        compra_inteligente=("intelligent_buy_qty", "sum"),
+    )
+    .sort_values("ventas_3y", ascending=False)
+)
+st.dataframe(summary_brand, use_container_width=True)
+
+st.subheader("Resumen ABC")
+summary_abc = (
+    view.groupby("abc", as_index=False)
+    .agg(
+        items=("part_no", "count"),
+        ventas_uyu=("sales_uyu", "sum"),
+        stock=("stock", "sum"),
+        sugerido=("suggested_order_qty", "sum"),
+    )
+    .sort_values("abc")
+)
+st.dataframe(summary_abc, use_container_width=True)
+
+st.subheader("Top productos por ventas")
+top_sales = view.sort_values("sales_units", ascending=False).head(top_n)
+st.dataframe(
+    top_sales[
+        [
+            "empresa",
+            "part_no",
+            "description",
+            "brand",
+            "sales_units",
+            "stock",
+            "months_of_stock",
+            "abc",
+            "status",
+        ]
+    ],
+    use_container_width=True,
+)
+
+fig, ax = plt.subplots(figsize=(10, 5))
+plot_df = top_sales.head(15)
+ax.bar(plot_df["part_no"], plot_df["sales_units"])
+ax.set_title("Top 15 por unidades vendidas")
+ax.set_xlabel("Código")
+ax.set_ylabel("Unidades")
+ax.tick_params(axis="x", rotation=60)
+fig.tight_layout()
 st.pyplot(fig)
 
-st.success("Sistema funcionando correctamente ✅")
+st.subheader("Pedido inteligente")
+pedido_inteligente = view[view["selected_for_purchase"]].copy()
+pedido_inteligente = pedido_inteligente.sort_values(
+    ["smart_score", "intelligent_buy_cost"], ascending=[False, False]
+)
+st.dataframe(
+    pedido_inteligente[
+        [
+            "empresa",
+            "part_no",
+            "description",
+            "brand",
+            "abc",
+            "status",
+            "stock",
+            "backorder_qty",
+            "monthly_order_qty",
+            "suggested_order_qty",
+            "intelligent_buy_qty",
+            "estimated_unit_cost",
+            "intelligent_buy_cost",
+            "estimated_gross_profit",
+            "smart_score",
+        ]
+    ],
+    use_container_width=True,
+    height=450,
+)
+
+st.subheader("Stock muerto")
+stock_muerto_df = view[view["stock_muerto"]].copy()
+st.dataframe(
+    stock_muerto_df[
+        ["empresa", "part_no", "description", "brand", "stock", "months_of_stock"]
+    ],
+    use_container_width=True,
+    height=300,
+)
+
+st.subheader("Ofertas sugeridas")
+ofertas_df = view[view["oferta_sugerida"]].copy()
+st.dataframe(
+    ofertas_df[
+        [
+            "empresa",
+            "part_no",
+            "description",
+            "brand",
+            "stock",
+            "months_of_stock",
+            "sales_units",
+            "abc",
+        ]
+    ],
+    use_container_width=True,
+    height=300,
+)
+
+st.subheader("Detalle completo")
+detail_cols = [
+    "empresa",
+    "part_no",
+    "description",
+    "brand",
+    "sales_units",
+    "sales_uyu",
+    "cost_uyu",
+    "avg_monthly_units",
+    "avg_annual_units",
+    "stock",
+    "backorder_qty",
+    "monthly_order_qty",
+    "pipeline_qty",
+    "available_plus_pipeline",
+    "months_of_stock",
+    "target_stock_qty",
+    "lead_time_need_qty",
+    "suggested_order_qty",
+    "abc",
+    "status",
+    "stock_muerto",
+    "oferta_sugerida",
+    "estimated_unit_cost",
+    "intelligent_buy_qty",
+    "intelligent_buy_cost",
+    "estimated_gross_profit",
+    "smart_score",
+]
+st.dataframe(view[detail_cols], use_container_width=True, height=500)
+
+excel_bytes = to_excel_bytes(
+    {
+        "pedido_inteligente": pedido_inteligente[detail_cols] if not pedido_inteligente.empty else pd.DataFrame(columns=detail_cols),
+        "stock_muerto": stock_muerto_df[detail_cols] if not stock_muerto_df.empty else pd.DataFrame(columns=detail_cols),
+        "ofertas": ofertas_df[detail_cols] if not ofertas_df.empty else pd.DataFrame(columns=detail_cols),
+        "resumen_marca": summary_brand,
+        "resumen_abc": summary_abc,
+        "detalle_completo": view[detail_cols],
+    }
+)
+
+st.download_button(
+    "Descargar análisis en Excel",
+    data=excel_bytes,
+    file_name="ali_inventory_resultado.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+
+st.success("Análisis completo generado correctamente.")
