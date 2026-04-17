@@ -5,6 +5,7 @@ import sqlite3
 from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -18,6 +19,7 @@ DEFAULT_TARGET_MONTHS = 6
 DEFAULT_LEAD_TIME_MONTHS = 6
 DEFAULT_CAPITAL = 500000.0
 DEFAULT_COMPANY = "Magna"
+AUTO_ORDER_FOLDER = APP_DIR / "Pedidos Solicitados"
 
 
 # =========================================================
@@ -145,6 +147,56 @@ def safe_text(value) -> str:
     return str(value).strip()
 
 
+class LocalSourceFile:
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.name = self.path.name
+        self._bytes = None
+
+    def getvalue(self) -> bytes:
+        if self._bytes is None:
+            self._bytes = self.path.read_bytes()
+        return self._bytes
+
+    def __fspath__(self):
+        return str(self.path)
+
+
+def build_file_hash(uploaded_file) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(uploaded_file.name.encode("utf-8"))
+    hasher.update(uploaded_file.getvalue())
+    return hasher.hexdigest()
+
+
+def find_latest_file(base_dir: Path, patterns: list[str], recursive: bool = False) -> Optional[LocalSourceFile]:
+    candidates = []
+    for pattern in patterns:
+        iterator = base_dir.rglob(pattern) if recursive else base_dir.glob(pattern)
+        candidates.extend(path for path in iterator if path.is_file())
+
+    if not candidates:
+        return None
+
+    latest_path = max(candidates, key=lambda item: (item.stat().st_mtime, item.name))
+    return LocalSourceFile(latest_path)
+
+
+def detect_default_source_files(base_dir: Path) -> dict:
+    return {
+        "ventas": find_latest_file(base_dir, ["ventas_de_3*.xls", "ventas_de_3*.xlsx"]),
+        "inventario": find_latest_file(base_dir, ["inventario_*.xls", "inventario_*.xlsx"]),
+        "backorder": find_latest_file(base_dir, ["backorder*.xls", "backorder*.xlsx"]),
+        "pedido_fabrica": find_latest_file(AUTO_ORDER_FOLDER, ["*.xls", "*.xlsx"], recursive=True)
+        if AUTO_ORDER_FOLDER.exists()
+        else None,
+    }
+
+
+def resolve_source_file(uploaded_file, detected_file):
+    return uploaded_file if uploaded_file is not None else detected_file
+
+
 def build_source_hash(
     empresa: str,
     analysis_month: str,
@@ -270,11 +322,22 @@ def load_monthly_order(uploaded_file) -> pd.DataFrame:
 
     part_col = "PART NO" if "PART NO" in df.columns else df.columns[0]
     qty_col = "PCS" if "PCS" in df.columns else df.columns[1]
+    order_no_col = "ORDER NO" if "ORDER NO" in df.columns else None
 
     df["part_no"] = df[part_col].map(normalize_part)
     df["monthly_order_qty"] = safe_numeric(df[qty_col])
     df = df[df["part_no"] != ""].copy()
-    return df.groupby("part_no", as_index=False)["monthly_order_qty"].sum()
+    order_summary = df.groupby("part_no", as_index=False)["monthly_order_qty"].sum()
+
+    order_code = ""
+    if order_no_col and order_no_col in df.columns:
+        order_values = [safe_text(value) for value in df[order_no_col].dropna().tolist() if safe_text(value)]
+        if order_values:
+            order_code = order_values[0]
+
+    order_summary.attrs["order_code"] = order_code if order_code else Path(uploaded_file.name).stem
+    order_summary.attrs["source_file_name"] = uploaded_file.name
+    return order_summary
 
 
 # =========================================================
@@ -486,12 +549,21 @@ def build_analysis_dataframe(
     stock_df: pd.DataFrame,
     backorder_df: pd.DataFrame,
     order_df: pd.DataFrame,
+    open_orders_df: Optional[pd.DataFrame],
     target_months: int,
     lead_time_months: int,
     capital_available: float,
     empresa: str,
 ) -> pd.DataFrame:
     final_df = merge_all(sales_df, stock_df, backorder_df, order_df)
+    if open_orders_df is None or open_orders_df.empty:
+        final_df["open_order_qty_db"] = 0.0
+    else:
+        final_df = final_df.merge(open_orders_df[["part_no", "open_order_qty_db"]], on="part_no", how="left")
+        final_df["open_order_qty_db"] = pd.to_numeric(final_df["open_order_qty_db"], errors="coerce").fillna(0.0)
+
+    final_df["pipeline_qty"] = final_df["backorder_qty"] + final_df["monthly_order_qty"] + final_df["open_order_qty_db"]
+    final_df["available_plus_pipeline"] = final_df["stock"] + final_df["pipeline_qty"]
     final_df = add_inventory_logic(final_df, target_months, lead_time_months)
     final_df = add_abc(final_df)
     final_df = add_intelligent_order(final_df, capital_available)
@@ -508,6 +580,12 @@ def get_connection():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def ensure_column(conn, table_name: str, column_name: str, definition: str):
+    existing_cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})")}
+    if column_name not in existing_cols:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
 
 
 def init_db():
@@ -585,6 +663,9 @@ def init_db():
                 created_at TEXT NOT NULL,
                 source_type TEXT NOT NULL,
                 order_name TEXT,
+                order_code TEXT,
+                order_file_hash TEXT,
+                file_name TEXT,
                 total_items INTEGER DEFAULT 0,
                 total_qty REAL DEFAULT 0,
                 status TEXT DEFAULT 'ABIERTO',
@@ -603,11 +684,23 @@ def init_db():
                 description TEXT,
                 brand TEXT,
                 quantity REAL DEFAULT 0,
+                received_qty REAL DEFAULT 0,
+                open_qty REAL DEFAULT 0,
+                last_reconciled_at TEXT,
                 status TEXT DEFAULT 'ABIERTO',
                 FOREIGN KEY (batch_id) REFERENCES factory_order_batches(id) ON DELETE CASCADE
             )
             """
         )
+
+        ensure_column(conn, "factory_order_batches", "order_code", "TEXT")
+        ensure_column(conn, "factory_order_batches", "order_file_hash", "TEXT")
+        ensure_column(conn, "factory_order_batches", "file_name", "TEXT")
+        ensure_column(conn, "factory_order_items", "received_qty", "REAL DEFAULT 0")
+        ensure_column(conn, "factory_order_items", "open_qty", "REAL DEFAULT 0")
+        ensure_column(conn, "factory_order_items", "last_reconciled_at", "TEXT")
+        conn.execute("UPDATE factory_order_items SET received_qty = COALESCE(received_qty, 0)")
+        conn.execute("UPDATE factory_order_items SET open_qty = COALESCE(open_qty, quantity)")
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_analysis_runs_company_date ON analysis_runs(empresa, analysis_date, created_at)"
@@ -620,6 +713,9 @@ def init_db():
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_order_items_batch_part ON factory_order_items(batch_id, part_no)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_order_batches_file_hash ON factory_order_batches(order_file_hash)"
         )
 
         migrate_legacy_data(conn)
@@ -781,18 +877,22 @@ def create_order_batch(
     empresa: str,
     analysis_month: str,
     created_at: str,
-    source_hash: str,
+    order_file_hash: str,
     source_type: str,
     order_name: str,
     order_df: pd.DataFrame,
     final_df: pd.DataFrame,
+    file_name: str,
     notes: str,
 ):
     if order_df.empty:
         return None, False
 
-    batch_hash = f"{source_hash}:pedido"
-    existing = conn.execute("SELECT id FROM factory_order_batches WHERE source_hash = ?", (batch_hash,)).fetchone()
+    batch_hash = f"pedido:{order_file_hash}" if order_file_hash else f"pedido:{analysis_month}:{order_name}"
+    existing = conn.execute(
+        "SELECT id FROM factory_order_batches WHERE source_hash = ? OR order_file_hash = ?",
+        (batch_hash, order_file_hash),
+    ).fetchone()
     if existing:
         return existing["id"], True
 
@@ -808,15 +908,16 @@ def create_order_batch(
     if order_enriched.empty:
         return None, False
 
+    order_code = safe_text(order_df.attrs.get("order_code", "")) or safe_text(order_name)
     total_qty = float(order_enriched["monthly_order_qty"].sum())
     total_items = int(len(order_enriched))
 
     cursor = conn.execute(
         """
         INSERT INTO factory_order_batches (
-            run_id, empresa, analysis_month, created_at, source_type, order_name,
-            total_items, total_qty, status, source_hash, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ABIERTO', ?, ?)
+            run_id, empresa, analysis_month, created_at, source_type, order_name, order_code,
+            order_file_hash, file_name, total_items, total_qty, status, source_hash, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ABIERTO', ?, ?)
         """,
         (
             run_id,
@@ -825,6 +926,9 @@ def create_order_batch(
             created_at,
             source_type,
             order_name,
+            order_code,
+            order_file_hash,
+            file_name,
             total_items,
             total_qty,
             batch_hash,
@@ -843,14 +947,19 @@ def create_order_batch(
                 safe_text(row["description"]),
                 safe_text(row["brand"]),
                 qty,
+                0.0,
+                qty,
+                None,
                 "ABIERTO",
             )
         )
 
     conn.executemany(
         """
-        INSERT INTO factory_order_items (batch_id, part_no, description, brand, quantity, status)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO factory_order_items (
+            batch_id, part_no, description, brand, quantity, received_qty, open_qty, last_reconciled_at, status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         item_rows,
     )
@@ -860,6 +969,14 @@ def create_order_batch(
 def migrate_legacy_data(conn):
     existing_runs = conn.execute("SELECT COUNT(*) AS qty FROM analysis_runs").fetchone()["qty"]
     if existing_runs > 0:
+        return
+
+    legacy_tables = {
+        row["name"]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    required_legacy_tables = {"stock_mensual", "backorder", "pedidos_emitidos", "ventas_base_3anios"}
+    if not required_legacy_tables.issubset(legacy_tables):
         return
 
     legacy_periods = [row["periodo"] for row in conn.execute("SELECT DISTINCT periodo FROM stock_mensual ORDER BY periodo")]
@@ -938,6 +1055,7 @@ def migrate_legacy_data(conn):
             legacy_stock,
             legacy_backorder,
             legacy_orders,
+            None,
             DEFAULT_TARGET_MONTHS,
             DEFAULT_LEAD_TIME_MONTHS,
             0.0,
@@ -982,11 +1100,12 @@ def migrate_legacy_data(conn):
             empresa=DEFAULT_COMPANY,
             analysis_month=period,
             created_at=created_at,
-            source_hash=source_hash,
+            order_file_hash=f"legacy-order::{DEFAULT_COMPANY}::{period}",
             source_type="legacy_migration",
             order_name=f"Pedido legacy {period}",
             order_df=legacy_orders,
             final_df=final_df,
+            file_name=f"legacy:{period}",
             notes="Migracion automatica de pedidos_emitidos.",
         )
 
@@ -1007,6 +1126,7 @@ def save_analysis_run(
     order_df: pd.DataFrame,
     final_df: pd.DataFrame,
     source_hash: str,
+    order_file_hash: str,
     register_current_order: bool,
     notes: str,
 ):
@@ -1047,21 +1167,24 @@ def save_analysis_run(
             }
 
         persist_analysis_items(conn, run_id, final_df)
+        reconcile_open_orders_with_inventory(conn, empresa, final_df, created_at)
 
         batch_id = None
         if register_current_order:
-            order_name = f"Pedido fabrica {analysis_month} - corrida {run_id}"
+            order_code = safe_text(order_df.attrs.get("order_code", ""))
+            order_name = order_code if order_code else f"Pedido fabrica {analysis_month} - corrida {run_id}"
             batch_id, _ = create_order_batch(
                 conn=conn,
                 run_id=run_id,
                 empresa=empresa,
                 analysis_month=analysis_month,
                 created_at=created_at,
-                source_hash=source_hash,
+                order_file_hash=order_file_hash,
                 source_type="archivo_pedido_mensual",
                 order_name=order_name,
                 order_df=order_df,
                 final_df=final_df,
+                file_name=pedido_file.name,
                 notes=notes,
             )
 
@@ -1107,16 +1230,20 @@ def load_recent_order_batches(empresa: str, limit: int = 12) -> pd.DataFrame:
         df = pd.read_sql_query(
             """
             SELECT
-                id AS lote_id,
-                analysis_month AS mes_analisis,
-                created_at AS fecha_carga,
-                source_type AS origen,
-                order_name AS nombre_lote,
-                total_items,
-                total_qty,
-                status
-            FROM factory_order_batches
-            WHERE empresa = ?
+                b.id AS lote_id,
+                b.analysis_month AS mes_analisis,
+                b.created_at AS fecha_carga,
+                b.source_type AS origen,
+                COALESCE(b.order_code, b.order_name) AS nombre_lote,
+                b.file_name AS archivo,
+                b.total_items,
+                b.total_qty,
+                ROUND(COALESCE(SUM(i.open_qty), 0), 2) AS qty_abierta,
+                b.status
+            FROM factory_order_batches b
+            LEFT JOIN factory_order_items i ON i.batch_id = b.id
+            WHERE b.empresa = ?
+            GROUP BY b.id, b.analysis_month, b.created_at, b.source_type, b.order_code, b.order_name, b.file_name, b.total_items, b.total_qty, b.status
             ORDER BY created_at DESC
             LIMIT ?
             """,
@@ -1165,6 +1292,31 @@ def load_run_items(run_id: int) -> pd.DataFrame:
     return df
 
 
+def load_open_factory_orders_by_part(empresa: str, exclude_order_file_hash: Optional[str] = None) -> pd.DataFrame:
+    params = [empresa]
+    query = """
+        SELECT
+            i.part_no,
+            ROUND(COALESCE(SUM(i.open_qty), 0), 2) AS open_order_qty_db
+        FROM factory_order_items i
+        INNER JOIN factory_order_batches b ON b.id = i.batch_id
+        WHERE b.empresa = ?
+          AND b.status <> 'CANCELADO'
+          AND COALESCE(i.open_qty, 0) > 0
+    """
+
+    if exclude_order_file_hash:
+        query += " AND COALESCE(b.order_file_hash, '') <> ?"
+        params.append(exclude_order_file_hash)
+
+    query += " GROUP BY i.part_no"
+
+    with get_connection() as conn:
+        df = pd.read_sql_query(query, conn, params=params)
+
+    return df
+
+
 def load_order_history_by_part(empresa: str) -> pd.DataFrame:
     with get_connection() as conn:
         df = pd.read_sql_query(
@@ -1172,7 +1324,10 @@ def load_order_history_by_part(empresa: str) -> pd.DataFrame:
             SELECT
                 i.part_no,
                 ROUND(COALESCE(SUM(i.quantity), 0), 2) AS ordered_total_db,
+                ROUND(COALESCE(SUM(i.received_qty), 0), 2) AS received_total_db,
+                ROUND(COALESCE(SUM(i.open_qty), 0), 2) AS open_order_qty_db,
                 MAX(b.created_at) AS last_order_at,
+                MAX(COALESCE(b.order_code, b.order_name)) AS last_order_code,
                 COUNT(DISTINCT b.id) AS order_batches_db
             FROM factory_order_items i
             INNER JOIN factory_order_batches b ON b.id = i.batch_id
@@ -1186,12 +1341,106 @@ def load_order_history_by_part(empresa: str) -> pd.DataFrame:
     return df
 
 
+def refresh_batch_status(conn, batch_id: int):
+    totals = conn.execute(
+        """
+        SELECT
+            COALESCE(SUM(quantity), 0) AS total_qty,
+            COALESCE(SUM(open_qty), 0) AS open_qty,
+            COALESCE(SUM(received_qty), 0) AS received_qty
+        FROM factory_order_items
+        WHERE batch_id = ?
+        """,
+        (batch_id,),
+    ).fetchone()
+
+    open_qty = float(totals["open_qty"] or 0)
+    received_qty = float(totals["received_qty"] or 0)
+    total_qty = float(totals["total_qty"] or 0)
+
+    if total_qty <= 0:
+        new_status = "VACIO"
+    elif open_qty <= 0:
+        new_status = "RECIBIDO_INFERIDO"
+    elif received_qty > 0:
+        new_status = "PARCIAL"
+    else:
+        new_status = "ABIERTO"
+
+    conn.execute("UPDATE factory_order_batches SET status = ? WHERE id = ?", (new_status, batch_id))
+
+
+def reconcile_open_orders_with_inventory(
+    conn,
+    empresa: str,
+    final_df: pd.DataFrame,
+    created_at: str,
+):
+    if "estimated_receipts_qty" not in final_df.columns:
+        return
+
+    receipts_df = final_df[["part_no", "estimated_receipts_qty"]].copy()
+    receipts_df["estimated_receipts_qty"] = pd.to_numeric(receipts_df["estimated_receipts_qty"], errors="coerce").fillna(0.0)
+    receipts_df = receipts_df[receipts_df["estimated_receipts_qty"] > 0]
+
+    if receipts_df.empty:
+        return
+
+    for _, row in receipts_df.iterrows():
+        remaining_qty = float(row["estimated_receipts_qty"])
+        if remaining_qty <= 0:
+            continue
+
+        open_items = conn.execute(
+            """
+            SELECT
+                i.id,
+                i.batch_id,
+                COALESCE(i.received_qty, 0) AS received_qty,
+                COALESCE(i.open_qty, i.quantity) AS open_qty
+            FROM factory_order_items i
+            INNER JOIN factory_order_batches b ON b.id = i.batch_id
+            WHERE b.empresa = ?
+              AND b.status <> 'CANCELADO'
+              AND i.part_no = ?
+              AND COALESCE(i.open_qty, 0) > 0
+            ORDER BY b.created_at ASC, i.id ASC
+            """,
+            (empresa, safe_text(row["part_no"])),
+        ).fetchall()
+
+        for item in open_items:
+            if remaining_qty <= 0:
+                break
+
+            item_open_qty = float(item["open_qty"] or 0)
+            if item_open_qty <= 0:
+                continue
+
+            inferred_received = min(item_open_qty, remaining_qty)
+            new_open_qty = item_open_qty - inferred_received
+            new_received_qty = float(item["received_qty"] or 0) + inferred_received
+            new_status = "RECIBIDO_INFERIDO" if new_open_qty <= 0 else "PARCIAL"
+
+            conn.execute(
+                """
+                UPDATE factory_order_items
+                SET received_qty = ?, open_qty = ?, last_reconciled_at = ?, status = ?
+                WHERE id = ?
+                """,
+                (new_received_qty, new_open_qty, created_at, new_status, item["id"]),
+            )
+            refresh_batch_status(conn, item["batch_id"])
+            remaining_qty -= inferred_received
+
+
 # =========================================================
 # Seguimiento historico
 # =========================================================
 def determine_tracking_status(row) -> str:
     current_file_order = float(row.get("monthly_order_qty", 0) or 0)
     registered_orders = float(row.get("ordered_total_db", 0) or 0)
+    open_orders = float(row.get("open_order_qty_db", 0) or 0)
     current_backorder = float(row.get("backorder_qty", 0) or 0)
     estimated_receipts = float(row.get("estimated_receipts_qty", 0) or 0)
     stock_delta = float(row.get("stock_delta", 0) or 0)
@@ -1206,6 +1455,8 @@ def determine_tracking_status(row) -> str:
         return "Pedido pendiente en backorder"
     if estimated_receipts > 0:
         return "Posible ingreso detectado"
+    if open_orders > 0:
+        return "Pedido abierto en fabrica"
     if stock_delta < 0:
         return "Baja de stock; pudo venderse"
     if registered_orders > 0:
@@ -1224,12 +1475,30 @@ def add_historical_context(
     order_history = load_order_history_by_part(empresa)
 
     if order_history.empty:
-        order_history = pd.DataFrame(columns=["part_no", "ordered_total_db", "last_order_at", "order_batches_db"])
+        order_history = pd.DataFrame(
+            columns=[
+                "part_no",
+                "ordered_total_db",
+                "received_total_db",
+                "open_order_total_db",
+                "last_order_at",
+                "last_order_code",
+                "order_batches_db",
+            ]
+        )
+    else:
+        order_history = order_history.rename(columns={"open_order_qty_db": "open_order_total_db"})
 
     out = out.merge(order_history, on="part_no", how="left")
-    out["ordered_total_db"] = out["ordered_total_db"].fillna(0)
-    out["order_batches_db"] = out["order_batches_db"].fillna(0)
+    out["ordered_total_db"] = pd.to_numeric(out["ordered_total_db"], errors="coerce").fillna(0.0)
+    out["received_total_db"] = pd.to_numeric(out["received_total_db"], errors="coerce").fillna(0.0)
+    if "open_order_qty_db" not in out.columns:
+        out["open_order_qty_db"] = 0.0
+    out["open_order_qty_db"] = pd.to_numeric(out["open_order_qty_db"], errors="coerce").fillna(0.0)
+    out["open_order_total_db"] = pd.to_numeric(out["open_order_total_db"], errors="coerce").fillna(0.0)
+    out["order_batches_db"] = pd.to_numeric(out["order_batches_db"], errors="coerce").fillna(0.0)
     out["last_order_date"] = pd.to_datetime(out["last_order_at"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    out["last_order_code"] = out["last_order_code"].fillna("")
     out = out.drop(columns=["last_order_at"])
 
     if baseline is None:
@@ -1337,6 +1606,8 @@ def main():
         st.session_state.empresa_seleccionada = None
         st.rerun()
 
+    detected_sources = detect_default_source_files(APP_DIR)
+
     with st.sidebar:
         st.header("Parametros")
         analysis_input = st.date_input("Mes de analisis", value=date.today().replace(day=1))
@@ -1349,7 +1620,7 @@ def main():
             step=50000.0,
         )
         top_n = st.slider("Top productos", 5, 50, 20)
-        register_current_order = st.checkbox("Registrar pedido mensual como pedido a fabrica", value=True)
+        register_current_order = st.checkbox("Registrar pedido a fabrica detectado/adjunto", value=True)
         save_note = st.text_input("Nota de corrida", placeholder="Ej: segunda carga del mes")
 
     analysis_date = normalize_analysis_date(analysis_input)
@@ -1360,18 +1631,41 @@ def main():
         f"Ventana base declarada para ventas 3 anios: {rolling_start.strftime('%Y-%m')} a {rolling_end.strftime('%Y-%m')}."
     )
 
-    st.subheader("Cargar archivos")
+    st.subheader("Fuentes detectadas en carpeta")
+    detected_rows = []
+    for label, key in [
+        ("Ventas 3 anios", "ventas"),
+        ("Inventario", "inventario"),
+        ("Backorder", "backorder"),
+        ("Pedido a fabrica", "pedido_fabrica"),
+    ]:
+        source = detected_sources.get(key)
+        detected_rows.append(
+            {
+                "tipo": label,
+                "archivo": source.name if source else "No encontrado",
+                "ruta": str(source.path) if source else "",
+            }
+        )
+    st.dataframe(pd.DataFrame(detected_rows), use_container_width=True, hide_index=True)
+
+    st.subheader("Opcional: reemplazar archivos detectados")
     upload_col_1, upload_col_2 = st.columns(2)
-    ventas_file = upload_col_1.file_uploader("Ventas 3 anios", type=["xls", "xlsx"])
-    inventario_file = upload_col_2.file_uploader("Inventario", type=["xls", "xlsx"])
+    ventas_upload = upload_col_1.file_uploader("Ventas 3 anios", type=["xls", "xlsx"])
+    inventario_upload = upload_col_2.file_uploader("Inventario", type=["xls", "xlsx"])
     upload_col_3, upload_col_4 = st.columns(2)
-    backorder_file = upload_col_3.file_uploader("Backorder", type=["xls", "xlsx"])
-    pedido_file = upload_col_4.file_uploader("Pedido mensual", type=["xls", "xlsx"])
+    backorder_upload = upload_col_3.file_uploader("Backorder", type=["xls", "xlsx"])
+    pedido_upload = upload_col_4.file_uploader("Pedido a fabrica", type=["xls", "xlsx"])
+
+    ventas_file = resolve_source_file(ventas_upload, detected_sources["ventas"])
+    inventario_file = resolve_source_file(inventario_upload, detected_sources["inventario"])
+    backorder_file = resolve_source_file(backorder_upload, detected_sources["backorder"])
+    pedido_file = resolve_source_file(pedido_upload, detected_sources["pedido_fabrica"])
 
     render_history_sections(empresa_activa)
 
     if not all([ventas_file, inventario_file, backorder_file, pedido_file]):
-        st.info("Subi los 4 archivos para generar una corrida y guardarla en la base.")
+        st.info("Falta al menos una fuente. Puedes dejar que la app use la carpeta o reemplazar manualmente alguno de los archivos.")
         st.stop()
 
     source_hash = build_source_hash(
@@ -1385,6 +1679,8 @@ def main():
         backorder_file,
         pedido_file,
     )
+    order_file_hash = build_file_hash(pedido_file)
+    open_orders_df = load_open_factory_orders_by_part(empresa_activa, exclude_order_file_hash=order_file_hash)
 
     try:
         sales_df = load_sales(ventas_file)
@@ -1397,6 +1693,7 @@ def main():
             stock_df=stock_df,
             backorder_df=backorder_df,
             order_df=order_df,
+            open_orders_df=open_orders_df,
             target_months=target_months,
             lead_time_months=lead_time_months,
             capital_available=capital_available,
@@ -1431,6 +1728,7 @@ def main():
                 order_df=order_df,
                 final_df=final_df,
                 source_hash=source_hash,
+                order_file_hash=order_file_hash,
                 register_current_order=register_current_order,
                 notes=save_note,
             )
@@ -1481,7 +1779,7 @@ def main():
     metric_col_3.metric("Ofertas", f"{int(view['oferta_sugerida'].sum()):,}")
     metric_col_4.metric("Pedido archivo", f"{int(view['monthly_order_qty'].sum()):,}")
     metric_col_5.metric("Compra sugerida", f"{int(view['suggested_order_qty'].sum()):,}")
-    metric_col_6.metric("Pedidos DB", f"{int((view['ordered_total_db'] > 0).sum()):,}")
+    metric_col_6.metric("Abierto DB", f"{int(view['open_order_qty_db'].sum()):,}")
 
     st.subheader("Resumen por marca")
     summary_brand = (
@@ -1492,6 +1790,7 @@ def main():
             stock=("stock", "sum"),
             backorder=("backorder_qty", "sum"),
             pedido_archivo=("monthly_order_qty", "sum"),
+            abierto_db=("open_order_qty_db", "sum"),
             compra_inteligente=("intelligent_buy_qty", "sum"),
         )
         .sort_values("ventas_3y", ascending=False)
@@ -1506,6 +1805,7 @@ def main():
             ventas_base=("sales_units", "sum"),
             stock=("stock", "sum"),
             pedido_archivo=("monthly_order_qty", "sum"),
+            abierto_db=("open_order_qty_db", "sum"),
             sugerido=("suggested_order_qty", "sum"),
         )
         .sort_values("abc")
@@ -1525,6 +1825,7 @@ def main():
                 "stock",
                 "backorder_qty",
                 "monthly_order_qty",
+                "open_order_qty_db",
                 "months_of_stock",
                 "abc",
                 "status",
@@ -1562,6 +1863,7 @@ def main():
                 "stock",
                 "backorder_qty",
                 "monthly_order_qty",
+                "open_order_qty_db",
                 "suggested_order_qty",
                 "intelligent_buy_qty",
                 "estimated_unit_cost",
@@ -1593,7 +1895,10 @@ def main():
         "description",
         "brand",
         "ordered_total_db",
+        "received_total_db",
+        "open_order_qty_db",
         "order_batches_db",
+        "last_order_code",
         "last_order_date",
         "monthly_order_qty",
         "stock_prev",
@@ -1657,7 +1962,10 @@ def main():
         "backorder_delta",
         "monthly_order_qty",
         "ordered_total_db",
+        "received_total_db",
+        "open_order_qty_db",
         "order_batches_db",
+        "last_order_code",
         "last_order_date",
         "pipeline_qty",
         "available_plus_pipeline",
