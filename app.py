@@ -111,6 +111,13 @@ def to_excel_bytes(sheets: dict) -> bytes:
     return output.getvalue()
 
 
+def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Hoja1") -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+    return output.getvalue()
+
+
 def normalize_analysis_date(raw_value) -> date:
     analysis_ts = pd.Timestamp(raw_value).replace(day=1)
     return analysis_ts.date()
@@ -213,6 +220,9 @@ def build_source_hash(
     hasher.update(header.encode("utf-8"))
 
     for uploaded in [ventas_file, inventario_file, backorder_file, pedido_file]:
+        if uploaded is None:
+            hasher.update(b"SIN_PEDIDO_FABRICA")
+            continue
         hasher.update(uploaded.name.encode("utf-8"))
         hasher.update(uploaded.getvalue())
 
@@ -338,6 +348,37 @@ def load_monthly_order(uploaded_file) -> pd.DataFrame:
     order_summary.attrs["order_code"] = order_code if order_code else Path(uploaded_file.name).stem
     order_summary.attrs["source_file_name"] = uploaded_file.name
     return order_summary
+
+
+def empty_monthly_order(source_name: str = "Sin pedido a fabrica") -> pd.DataFrame:
+    df = pd.DataFrame(columns=["part_no", "monthly_order_qty"])
+    df.attrs["order_code"] = ""
+    df.attrs["source_file_name"] = source_name
+    return df
+
+
+def build_mazda_order_to_request(pedido_inteligente: pd.DataFrame) -> pd.DataFrame:
+    if pedido_inteligente.empty:
+        return pd.DataFrame(columns=["ORDER NO", "LINE NO", "PART NO", "PCS"])
+
+    order_df = pedido_inteligente.copy()
+    mazda_mask = order_df["brand"].astype(str).str.upper().str.contains("MAZDA", na=False)
+    if mazda_mask.any():
+        order_df = order_df[mazda_mask].copy()
+
+    order_df["PCS"] = pd.to_numeric(order_df["intelligent_buy_qty"], errors="coerce").fillna(0).apply(math.ceil)
+    order_df = order_df[order_df["PCS"] > 0].copy()
+    order_df = order_df.sort_values(["smart_score", "sales_units"], ascending=[False, False]).reset_index(drop=True)
+
+    export_df = pd.DataFrame(
+        {
+            "ORDER NO": "",
+            "LINE NO": range(1, len(order_df) + 1),
+            "PART NO": order_df["part_no"].astype(str),
+            "PCS": order_df["PCS"].astype(int),
+        }
+    )
+    return export_df
 
 
 # =========================================================
@@ -1149,7 +1190,7 @@ def save_analysis_run(
             sales_filename=ventas_file.name,
             inventory_filename=inventario_file.name,
             backorder_filename=backorder_file.name,
-            order_filename=pedido_file.name,
+            order_filename=pedido_file.name if pedido_file is not None else "Sin pedido a fabrica",
             sales_rows=len(sales_df),
             inventory_rows=len(stock_df),
             backorder_rows=len(backorder_df),
@@ -1170,7 +1211,7 @@ def save_analysis_run(
         reconcile_open_orders_with_inventory(conn, empresa, final_df, created_at)
 
         batch_id = None
-        if register_current_order:
+        if register_current_order and pedido_file is not None and not order_df.empty:
             order_code = safe_text(order_df.attrs.get("order_code", ""))
             order_name = order_code if order_code else f"Pedido fabrica {analysis_month} - corrida {run_id}"
             batch_id, _ = create_order_batch(
@@ -1620,7 +1661,7 @@ def main():
             step=50000.0,
         )
         top_n = st.slider("Top productos", 5, 50, 20)
-        register_current_order = st.checkbox("Registrar pedido a fabrica detectado/adjunto", value=True)
+        register_current_order = st.checkbox("Registrar pedido a fabrica adjunto si existe", value=True)
         save_note = st.text_input("Nota de corrida", placeholder="Ej: segunda carga del mes")
 
     analysis_date = normalize_analysis_date(analysis_input)
@@ -1664,8 +1705,8 @@ def main():
 
     render_history_sections(empresa_activa)
 
-    if not all([ventas_file, inventario_file, backorder_file, pedido_file]):
-        st.info("Falta al menos una fuente. Puedes dejar que la app use la carpeta o reemplazar manualmente alguno de los archivos.")
+    if not all([ventas_file, inventario_file, backorder_file]):
+        st.info("Para calcular el pedido a solicitar necesitas cargar Ventas 3 anios, Inventario y Backorder. El Pedido a fabrica es opcional.")
         st.stop()
 
     source_hash = build_source_hash(
@@ -1679,14 +1720,17 @@ def main():
         backorder_file,
         pedido_file,
     )
-    order_file_hash = build_file_hash(pedido_file)
-    open_orders_df = load_open_factory_orders_by_part(empresa_activa, exclude_order_file_hash=order_file_hash)
+    order_file_hash = build_file_hash(pedido_file) if pedido_file is not None else ""
+    open_orders_df = load_open_factory_orders_by_part(
+        empresa_activa,
+        exclude_order_file_hash=order_file_hash if order_file_hash else None,
+    )
 
     try:
         sales_df = load_sales(ventas_file)
         stock_df = load_inventory(inventario_file)
         backorder_df = load_backorder(backorder_file)
-        order_df = load_monthly_order(pedido_file)
+        order_df = load_monthly_order(pedido_file) if pedido_file is not None else empty_monthly_order()
 
         final_df = build_analysis_dataframe(
             sales_df=sales_df,
@@ -1876,6 +1920,19 @@ def main():
         height=420,
     )
 
+    st.subheader("Pedido a solicitar a Mazda")
+    pedido_mazda_df = build_mazda_order_to_request(pedido_inteligente)
+    if pedido_mazda_df.empty:
+        st.info("No hay piezas Mazda seleccionadas para pedir con los parametros actuales.")
+    else:
+        st.dataframe(pedido_mazda_df, use_container_width=True, height=320)
+        st.download_button(
+            "Descargar pedido a solicitar a Mazda",
+            data=dataframe_to_excel_bytes(pedido_mazda_df),
+            file_name=f"pedido_a_solicitar_mazda_{analysis_month}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
     st.subheader("Seguimiento historico de pedidos")
     tracking_view = view[
         (view["ordered_total_db"] > 0)
@@ -1994,6 +2051,7 @@ def main():
     excel_bytes = to_excel_bytes(
         {
             "pedido_inteligente": pedido_inteligente[detail_cols],
+            "pedido_a_solicitar_mazda": pedido_mazda_df,
             "seguimiento_pedidos": tracking_view[tracking_cols] if not tracking_view.empty else pd.DataFrame(columns=tracking_cols),
             "stock_muerto": stock_muerto_df[detail_cols],
             "ofertas": ofertas_df[detail_cols],
