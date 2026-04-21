@@ -24,6 +24,11 @@ DEFAULT_LEAD_TIME_MONTHS = 6
 DEFAULT_CAPITAL = 500000.0
 DEFAULT_COMPANY = "Magna"
 AUTO_ORDER_FOLDER = APP_DIR / "Pedidos Solicitados"
+EDITABLE_ORDER_SOURCE_TYPE = "pedido_editable_mazda"
+ORDER_DRAFT_STATUS = "BORRADOR"
+ORDER_CONFIRMED_STATUS = "ABIERTO"
+LOCKED_ORDER_STATUSES = {"ABIERTO", "PARCIAL", "RECIBIDO_INFERIDO", "VACIO"}
+ORDER_EDITOR_COLUMNS = ["PART NO", "PCS", "DESCRIPCION", "MARCA"]
 
 
 # =========================================================
@@ -380,6 +385,115 @@ def safe_text(value) -> str:
     return str(value).strip()
 
 
+def empty_order_editor_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=ORDER_EDITOR_COLUMNS)
+
+
+def normalize_order_items_df(items_df: pd.DataFrame) -> pd.DataFrame:
+    columns = ["part_key", "part_no", "description", "brand", "quantity"]
+    if items_df is None or items_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    source = items_df.copy()
+    part_col = "PART NO" if "PART NO" in source.columns else "part_no"
+    qty_col = "PCS" if "PCS" in source.columns else "quantity"
+    desc_col = "DESCRIPCION" if "DESCRIPCION" in source.columns else "description"
+    brand_col = "MARCA" if "MARCA" in source.columns else "brand"
+
+    if part_col not in source.columns:
+        source[part_col] = ""
+    if qty_col not in source.columns:
+        source[qty_col] = 0
+    if desc_col not in source.columns:
+        source[desc_col] = ""
+    if brand_col not in source.columns:
+        source[brand_col] = ""
+
+    source = add_part_identity(source, part_col, allow_mazda_compact=True)
+    source["quantity"] = pd.to_numeric(source[qty_col], errors="coerce").fillna(0.0)
+    source["description"] = source[desc_col].fillna("").astype(str).str.strip()
+    source["brand"] = source[brand_col].fillna("").astype(str).str.strip()
+    source = source[(source["part_key"] != "") & (source["quantity"] > 0)].copy()
+    if source.empty:
+        return pd.DataFrame(columns=columns)
+
+    grouped = (
+        source.groupby("part_key", as_index=False)
+        .agg(
+            part_no=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
+            description=("description", first_non_empty),
+            brand=("brand", first_non_empty),
+            quantity=("quantity", "sum"),
+        )
+        .sort_values("part_no")
+        .reset_index(drop=True)
+    )
+    grouped["brand"] = grouped.apply(
+        lambda row: row["brand"] if safe_text(row["brand"]) else detect_brand(row["part_no"], row["description"]),
+        axis=1,
+    )
+    return grouped[columns]
+
+
+def order_items_to_editor_df(items_df: pd.DataFrame) -> pd.DataFrame:
+    normalized = normalize_order_items_df(items_df)
+    if normalized.empty:
+        return empty_order_editor_df()
+
+    out = pd.DataFrame(
+        {
+            "PART NO": normalized["part_no"],
+            "PCS": normalized["quantity"].apply(lambda qty: int(qty) if float(qty).is_integer() else float(qty)),
+            "DESCRIPCION": normalized["description"],
+            "MARCA": normalized["brand"],
+        }
+    )
+    return out[ORDER_EDITOR_COLUMNS]
+
+
+def format_order_for_factory_download(items_df: pd.DataFrame, order_code: str = "") -> pd.DataFrame:
+    normalized = normalize_order_items_df(items_df)
+    if normalized.empty:
+        return pd.DataFrame(columns=["ORDER NO", "LINE NO", "PART NO", "PCS"])
+
+    export_df = pd.DataFrame(
+        {
+            "ORDER NO": safe_text(order_code),
+            "LINE NO": range(1, len(normalized) + 1),
+            "PART NO": normalized["part_no"].astype(str),
+            "PCS": normalized["quantity"].apply(lambda qty: int(math.ceil(float(qty)))),
+        }
+    )
+    return export_df
+
+
+def build_editable_order_from_intelligent(pedido_inteligente: pd.DataFrame) -> pd.DataFrame:
+    if pedido_inteligente.empty:
+        return empty_order_editor_df()
+
+    order_df = pedido_inteligente.copy()
+    mazda_mask = order_df["brand"].astype(str).str.upper().str.contains("MAZDA", na=False)
+    if mazda_mask.any():
+        order_df = order_df[mazda_mask].copy()
+
+    order_df["PCS"] = pd.to_numeric(order_df["intelligent_buy_qty"], errors="coerce").fillna(0).apply(math.ceil)
+    order_df = order_df[order_df["PCS"] > 0].copy()
+    if order_df.empty:
+        return empty_order_editor_df()
+
+    order_df = order_df.sort_values(["smart_score", "sales_units"], ascending=[False, False]).reset_index(drop=True)
+    return order_items_to_editor_df(
+        pd.DataFrame(
+            {
+                "PART NO": order_df["part_no"].astype(str),
+                "PCS": order_df["PCS"].astype(int),
+                "DESCRIPCION": order_df["description"].astype(str),
+                "MARCA": order_df["brand"].astype(str),
+            }
+        )
+    )
+
+
 class LocalSourceFile:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -626,27 +740,8 @@ def empty_monthly_order(source_name: str = "Sin pedido a fabrica") -> pd.DataFra
 
 
 def build_mazda_order_to_request(pedido_inteligente: pd.DataFrame) -> pd.DataFrame:
-    if pedido_inteligente.empty:
-        return pd.DataFrame(columns=["ORDER NO", "LINE NO", "PART NO", "PCS"])
-
-    order_df = pedido_inteligente.copy()
-    mazda_mask = order_df["brand"].astype(str).str.upper().str.contains("MAZDA", na=False)
-    if mazda_mask.any():
-        order_df = order_df[mazda_mask].copy()
-
-    order_df["PCS"] = pd.to_numeric(order_df["intelligent_buy_qty"], errors="coerce").fillna(0).apply(math.ceil)
-    order_df = order_df[order_df["PCS"] > 0].copy()
-    order_df = order_df.sort_values(["smart_score", "sales_units"], ascending=[False, False]).reset_index(drop=True)
-
-    export_df = pd.DataFrame(
-        {
-            "ORDER NO": "",
-            "LINE NO": range(1, len(order_df) + 1),
-            "PART NO": order_df["part_no"].astype(str),
-            "PCS": order_df["PCS"].astype(int),
-        }
-    )
-    return export_df
+    editable_df = build_editable_order_from_intelligent(pedido_inteligente)
+    return format_order_for_factory_download(editable_df)
 
 
 # =========================================================
@@ -1311,6 +1406,205 @@ def create_order_batch(
     return batch_id, False
 
 
+def replace_order_items(conn, batch_id: int, items_df: pd.DataFrame, status: str):
+    normalized = normalize_order_items_df(items_df)
+    if normalized.empty:
+        raise ValueError("El pedido no tiene lineas con codigo y cantidad mayor a cero.")
+
+    conn.execute("DELETE FROM factory_order_items WHERE batch_id = ?", (batch_id,))
+    open_when_confirmed = status != ORDER_DRAFT_STATUS
+    item_rows = []
+    for _, row in normalized.iterrows():
+        qty = float(row["quantity"])
+        item_rows.append(
+            (
+                batch_id,
+                safe_text(row["part_no"]),
+                safe_text(row["description"]),
+                safe_text(row["brand"]),
+                qty,
+                0.0,
+                qty if open_when_confirmed else 0.0,
+                None,
+                ORDER_CONFIRMED_STATUS if open_when_confirmed else ORDER_DRAFT_STATUS,
+            )
+        )
+
+    conn.executemany(
+        """
+        INSERT INTO factory_order_items (
+            batch_id, part_no, description, brand, quantity, received_qty, open_qty, last_reconciled_at, status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        item_rows,
+    )
+    conn.execute(
+        """
+        UPDATE factory_order_batches
+        SET total_items = ?, total_qty = ?
+        WHERE id = ?
+        """,
+        (int(len(normalized)), float(normalized["quantity"].sum()), batch_id),
+    )
+
+
+def create_editable_order_draft(
+    empresa: str,
+    analysis_month: str,
+    order_name: str,
+    items_df: pd.DataFrame,
+    notes: str = "",
+) -> int:
+    order_name = safe_text(order_name) or f"Pedido Mazda {analysis_month}"
+    created_at = datetime.now().replace(microsecond=0).isoformat()
+    source_seed = f"{empresa}|{analysis_month}|{order_name}|{datetime.now().isoformat(timespec='microseconds')}"
+    source_hash = "editable:" + hashlib.sha256(source_seed.encode("utf-8")).hexdigest()
+
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO factory_order_batches (
+                run_id, empresa, analysis_month, created_at, source_type, order_name, order_code,
+                order_file_hash, file_name, total_items, total_qty, status, source_hash, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+            """,
+            (
+                None,
+                empresa,
+                analysis_month,
+                created_at,
+                EDITABLE_ORDER_SOURCE_TYPE,
+                order_name,
+                order_name,
+                "",
+                "pedido_editable",
+                ORDER_DRAFT_STATUS,
+                source_hash,
+                notes,
+            ),
+        )
+        batch_id = int(cursor.lastrowid)
+        replace_order_items(conn, batch_id, items_df, ORDER_DRAFT_STATUS)
+        conn.commit()
+        return batch_id
+
+
+def load_editable_order_batches(empresa: str, limit: int = 50) -> pd.DataFrame:
+    with get_connection() as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                id,
+                analysis_month,
+                created_at,
+                COALESCE(order_code, order_name) AS order_code,
+                order_name,
+                total_items,
+                total_qty,
+                status,
+                notes
+            FROM factory_order_batches
+            WHERE empresa = ?
+              AND source_type = ?
+              AND status <> 'CANCELADO'
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            conn,
+            params=(empresa, EDITABLE_ORDER_SOURCE_TYPE, limit),
+        )
+    return df
+
+
+def load_order_batch(batch_id: int):
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM factory_order_batches
+            WHERE id = ?
+            """,
+            (int(batch_id),),
+        ).fetchone()
+    return row
+
+
+def load_order_items(batch_id: int) -> pd.DataFrame:
+    with get_connection() as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                part_no,
+                description,
+                brand,
+                quantity
+            FROM factory_order_items
+            WHERE batch_id = ?
+            ORDER BY id
+            """,
+            conn,
+            params=(int(batch_id),),
+        )
+    return df
+
+
+def update_editable_order_draft(batch_id: int, order_name: str, items_df: pd.DataFrame, notes: str = ""):
+    order_name = safe_text(order_name) or f"Pedido editable #{batch_id}"
+    with get_connection() as conn:
+        batch = conn.execute(
+            "SELECT status FROM factory_order_batches WHERE id = ? AND source_type = ?",
+            (int(batch_id), EDITABLE_ORDER_SOURCE_TYPE),
+        ).fetchone()
+        if batch is None:
+            raise ValueError("No se encontro el pedido editable.")
+        if batch["status"] != ORDER_DRAFT_STATUS:
+            raise ValueError("Este pedido ya fue confirmado y no se puede modificar.")
+
+        replace_order_items(conn, batch_id, items_df, ORDER_DRAFT_STATUS)
+        conn.execute(
+            """
+            UPDATE factory_order_batches
+            SET order_name = ?, order_code = ?, notes = ?
+            WHERE id = ?
+            """,
+            (order_name, order_name, notes, int(batch_id)),
+        )
+        conn.commit()
+
+
+def confirm_editable_order(batch_id: int, order_name: str, items_df: pd.DataFrame, notes: str = ""):
+    order_name = safe_text(order_name) or f"Pedido editable #{batch_id}"
+    with get_connection() as conn:
+        batch = conn.execute(
+            "SELECT status FROM factory_order_batches WHERE id = ? AND source_type = ?",
+            (int(batch_id), EDITABLE_ORDER_SOURCE_TYPE),
+        ).fetchone()
+        if batch is None:
+            raise ValueError("No se encontro el pedido editable.")
+        if batch["status"] != ORDER_DRAFT_STATUS:
+            raise ValueError("Este pedido ya fue confirmado y no se puede modificar.")
+
+        replace_order_items(conn, batch_id, items_df, ORDER_CONFIRMED_STATUS)
+        conn.execute(
+            """
+            UPDATE factory_order_batches
+            SET order_name = ?, order_code = ?, notes = ?, status = ?
+            WHERE id = ?
+            """,
+            (order_name, order_name, notes, ORDER_CONFIRMED_STATUS, int(batch_id)),
+        )
+        conn.commit()
+
+
+def load_order_export_df(batch_id: int) -> pd.DataFrame:
+    batch = load_order_batch(batch_id)
+    if batch is None:
+        return pd.DataFrame(columns=["ORDER NO", "LINE NO", "PART NO", "PCS"])
+    items_df = load_order_items(batch_id)
+    return format_order_for_factory_download(items_df, safe_text(batch["order_code"] or batch["order_name"]))
+
+
 def migrate_legacy_data(conn):
     existing_runs = conn.execute("SELECT COUNT(*) AS qty FROM analysis_runs").fetchone()["qty"]
     if existing_runs > 0:
@@ -1664,7 +1958,7 @@ def load_open_factory_orders_by_part(empresa: str, exclude_order_file_hash: Opti
         FROM factory_order_items i
         INNER JOIN factory_order_batches b ON b.id = i.batch_id
         WHERE b.empresa = ?
-          AND b.status <> 'CANCELADO'
+          AND b.status NOT IN ('CANCELADO', 'BORRADOR')
           AND COALESCE(i.open_qty, 0) > 0
     """
 
@@ -1704,7 +1998,7 @@ def load_order_history_by_part(empresa: str) -> pd.DataFrame:
             FROM factory_order_items i
             INNER JOIN factory_order_batches b ON b.id = i.batch_id
             WHERE b.empresa = ?
-              AND b.status <> 'CANCELADO'
+              AND b.status NOT IN ('CANCELADO', 'BORRADOR')
             """,
             conn,
             params=(empresa,),
@@ -1810,7 +2104,7 @@ def reconcile_open_orders_with_inventory(
         FROM factory_order_items i
         INNER JOIN factory_order_batches b ON b.id = i.batch_id
         WHERE b.empresa = ?
-          AND b.status <> 'CANCELADO'
+          AND b.status NOT IN ('CANCELADO', 'BORRADOR')
           AND COALESCE(i.open_qty, 0) > 0
         ORDER BY b.created_at ASC, i.id ASC
         """,
@@ -2016,6 +2310,134 @@ def render_history_sections(empresa: str):
         st.info("Todavia no hay pedidos a fabrica registrados en la base.")
     else:
         st.dataframe(batches_df, use_container_width=True, height=240)
+
+
+def render_editable_order_manager(
+    empresa: str,
+    analysis_month: str,
+    suggested_order_df: pd.DataFrame,
+    default_note: str = "",
+):
+    st.subheader("Pedido editable")
+    with st.expander("Cargar pedido sugerido como borrador editable", expanded=False):
+        new_order_name = st.text_input(
+            "Nombre del pedido",
+            value=f"Pedido Mazda {analysis_month}",
+            key=f"new_editable_order_name_{analysis_month}",
+        )
+        if suggested_order_df.empty:
+            st.info("No hay lineas sugeridas para cargar en un borrador.")
+        else:
+            st.dataframe(suggested_order_df, use_container_width=True, height=220)
+            if st.button("Cargar pedido para editar", type="primary", key=f"load_editable_order_{analysis_month}"):
+                try:
+                    batch_id = create_editable_order_draft(
+                        empresa=empresa,
+                        analysis_month=analysis_month,
+                        order_name=new_order_name,
+                        items_df=suggested_order_df,
+                        notes=default_note,
+                    )
+                    st.session_state["editable_order_batch_id"] = batch_id
+                    st.success(f"Pedido #{batch_id} cargado como borrador editable.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"No se pudo cargar el pedido editable: {exc}")
+
+    batches_df = load_editable_order_batches(empresa)
+    if batches_df.empty:
+        st.info("Todavia no hay pedidos editables guardados.")
+        return
+
+    def option_label(row) -> str:
+        qty = _format_qty(row["total_qty"])
+        return f"#{int(row['id'])} - {row['order_code']} - {row['status']} - {qty} pcs"
+
+    options = [(int(row["id"]), option_label(row)) for _, row in batches_df.iterrows()]
+    option_ids = [item[0] for item in options]
+    selected_id = int(st.session_state.get("editable_order_batch_id", option_ids[0]))
+    if selected_id not in option_ids:
+        selected_id = option_ids[0]
+    selected_index = option_ids.index(selected_id)
+    selected_label = st.selectbox(
+        "Pedidos guardados",
+        [item[1] for item in options],
+        index=selected_index,
+        key="editable_order_selector",
+    )
+    selected_batch_id = options[[item[1] for item in options].index(selected_label)][0]
+    st.session_state["editable_order_batch_id"] = selected_batch_id
+
+    batch = load_order_batch(selected_batch_id)
+    if batch is None:
+        st.warning("No se encontro el pedido seleccionado.")
+        return
+
+    editable = batch["status"] == ORDER_DRAFT_STATUS
+    order_name = st.text_input(
+        "Nombre / ORDER NO",
+        value=safe_text(batch["order_code"] or batch["order_name"]),
+        disabled=not editable,
+        key=f"editable_order_name_{selected_batch_id}",
+    )
+    order_note = st.text_input(
+        "Nota del pedido",
+        value=safe_text(batch["notes"]),
+        disabled=not editable,
+        key=f"editable_order_note_{selected_batch_id}",
+    )
+
+    items_df = order_items_to_editor_df(load_order_items(selected_batch_id))
+    if editable:
+        edited_items = st.data_editor(
+            items_df,
+            hide_index=True,
+            use_container_width=True,
+            num_rows="dynamic",
+            key=f"editable_order_items_{selected_batch_id}",
+            column_config={
+                "PART NO": st.column_config.TextColumn("PART NO"),
+                "PCS": st.column_config.NumberColumn("PCS", min_value=0.0, step=1.0),
+                "DESCRIPCION": st.column_config.TextColumn("DESCRIPCION"),
+                "MARCA": st.column_config.TextColumn("MARCA"),
+            },
+        )
+    else:
+        st.info("Este pedido ya fue confirmado. Queda bloqueado y solo se puede descargar.")
+        st.dataframe(items_df, use_container_width=True, hide_index=True)
+        edited_items = items_df
+
+    export_df = format_order_for_factory_download(edited_items, order_name)
+    action_col_1, action_col_2, action_col_3 = st.columns([1, 1, 2])
+    action_col_1.download_button(
+        "Descargar pedido",
+        data=dataframe_to_excel_bytes(export_df, sheet_name="Pedido Mazda"),
+        file_name=f"pedido_mazda_{selected_batch_id}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        disabled=export_df.empty,
+        key=f"download_editable_order_{selected_batch_id}",
+    )
+
+    if editable:
+        if action_col_2.button("Guardar cambios", key=f"save_editable_order_{selected_batch_id}"):
+            try:
+                update_editable_order_draft(selected_batch_id, order_name, edited_items, order_note)
+                st.success("Cambios guardados en la base.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"No se pudieron guardar los cambios: {exc}")
+
+        if action_col_3.button(
+            "Confirmar pedido y bloquear",
+            type="primary",
+            key=f"confirm_editable_order_{selected_batch_id}",
+        ):
+            try:
+                confirm_editable_order(selected_batch_id, order_name, edited_items, order_note)
+                st.success("Pedido confirmado. Desde ahora queda bloqueado para edicion.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"No se pudo confirmar el pedido: {exc}")
 
 
 def main():
@@ -2341,7 +2763,8 @@ def main():
     )
 
     st.subheader("Pedido a solicitar a Mazda")
-    pedido_mazda_df = build_mazda_order_to_request(pedido_inteligente)
+    pedido_editor_df = build_editable_order_from_intelligent(pedido_inteligente)
+    pedido_mazda_df = format_order_for_factory_download(pedido_editor_df)
     if pedido_mazda_df.empty:
         st.info("No hay piezas Mazda seleccionadas para pedir con los parametros actuales.")
     else:
@@ -2352,6 +2775,13 @@ def main():
             file_name=f"pedido_a_solicitar_mazda_{analysis_month}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+    render_editable_order_manager(
+        empresa=empresa_activa,
+        analysis_month=analysis_month,
+        suggested_order_df=pedido_editor_df,
+        default_note=save_note,
+    )
 
     st.subheader("Seguimiento historico de pedidos")
     tracking_view = view[
