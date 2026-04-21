@@ -2523,7 +2523,7 @@ def render_final_order_upload_manager(
     default_note: str = "",
 ):
     st.subheader("Enviar pedido a fabrica")
-    st.caption("Descarga el sugerido, modificalo si hace falta y despues envia el Excel final con el numero real de pedido Mazda. Al enviarlo queda guardado y bloqueado.")
+    st.caption("Ajusta el pedido sugerido en la tabla, o carga un Excel final modificado. Al enviarlo queda guardado y bloqueado.")
 
     input_col_1, input_col_2 = st.columns([1, 2])
     order_number = input_col_1.text_input(
@@ -2539,7 +2539,7 @@ def render_final_order_upload_manager(
             input_col_1.success(classification["label"])
 
     final_upload = input_col_2.file_uploader(
-        "Excel final si lo modificaste",
+        "Excel final si ya lo modificaste afuera",
         type=["xlsx", "xls"],
         key=f"final_mazda_order_file_{analysis_month}",
     )
@@ -2553,13 +2553,30 @@ def render_final_order_upload_manager(
             return
     else:
         final_items_df = suggested_order_df.copy()
-        final_file_name = "pedido_sugerido_sin_modificar.xlsx"
+        final_file_name = "pedido_sugerido_ajustado.xlsx"
 
-    export_df = format_order_for_factory_download(final_items_df, classification["order_code"])
+    st.caption("Pedido a enviar. Podes cambiar PCS, eliminar lineas o agregar nuevos codigos antes de enviar.")
+    editor_key_suffix = final_upload.name if final_upload is not None else "pedido_sugerido"
+    edited_items_df = st.data_editor(
+        order_items_to_editor_df(final_items_df),
+        hide_index=True,
+        use_container_width=True,
+        num_rows="dynamic",
+        key=f"final_mazda_order_editor_{analysis_month}_{editor_key_suffix}",
+        column_config={
+            "PART NO": st.column_config.TextColumn("PART NO", required=True),
+            "PCS": st.column_config.NumberColumn("PCS", min_value=0.0, step=1.0, required=True),
+            "DESCRIPCION": st.column_config.TextColumn("DESCRIPCION"),
+            "MARCA": st.column_config.TextColumn("MARCA"),
+        },
+    )
+
+    export_df = format_order_for_factory_download(edited_items_df, classification["order_code"])
     if export_df.empty:
         st.info("No hay lineas para guardar en el pedido final.")
         return
 
+    st.caption("Vista previa del Excel que se guardara y enviara.")
     st.dataframe(export_df, use_container_width=True, height=260)
     action_col_1, action_col_2 = st.columns([1, 2])
     action_col_1.download_button(
@@ -2575,7 +2592,7 @@ def render_final_order_upload_manager(
                 empresa=empresa,
                 analysis_month=analysis_month,
                 order_number=order_number,
-                items_df=final_items_df,
+                items_df=edited_items_df,
                 file_name=final_file_name,
                 notes=default_note,
             )
