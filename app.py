@@ -2443,20 +2443,77 @@ def render_save_feedback():
         st.error(feedback.get("message", "No se pudo guardar la corrida."))
 
 
+def render_saved_factory_orders(empresa: str):
+    st.subheader("Pedidos a fabrica guardados en base")
+    batches_df = load_recent_order_batches(empresa)
+    if batches_df.empty:
+        st.info("Todavia no hay pedidos a fabrica registrados en la base.")
+        return
+
+    display_df = batches_df.rename(
+        columns={
+            "lote_id": "ID",
+            "mes_analisis": "MES",
+            "fecha_carga": "FECHA",
+            "origen": "ORIGEN",
+            "nombre_lote": "PEDIDO",
+            "archivo": "ARCHIVO",
+            "tipo_envio": "TIPO",
+            "demora_dias": "DEMORA DIAS",
+            "llegada_estimada": "LLEGADA ESTIMADA",
+            "total_items": "ITEMS",
+            "total_qty": "TOTAL PCS",
+            "qty_abierta": "PCS ABIERTAS",
+            "status": "ESTADO",
+        }
+    )
+    st.dataframe(display_df, use_container_width=True, height=240, hide_index=True)
+
+    def option_label(row) -> str:
+        tipo = safe_text(row.get("tipo_envio", "")) or "SIN TIPO"
+        qty = _format_qty(row.get("total_qty", 0))
+        return f"#{int(row['lote_id'])} - {row['nombre_lote']} - {tipo} - {row['status']} - {qty} pcs"
+
+    labels = [option_label(row) for _, row in batches_df.iterrows()]
+    selected_label = st.selectbox("Ver pedido guardado", labels, key="saved_factory_order_selector")
+    selected_index = labels.index(selected_label)
+    selected_batch = batches_df.iloc[selected_index]
+    selected_batch_id = int(selected_batch["lote_id"])
+    export_df = load_order_export_df(selected_batch_id)
+    items_df = order_items_to_editor_df(load_order_items(selected_batch_id))
+
+    detail_col_1, detail_col_2 = st.columns([2, 1])
+    with detail_col_1:
+        st.caption("Lineas guardadas")
+        st.dataframe(items_df, use_container_width=True, height=260, hide_index=True)
+    with detail_col_2:
+        st.metric("Pedido", safe_text(selected_batch["nombre_lote"]))
+        st.metric("Estado", safe_text(selected_batch["status"]))
+        tipo = safe_text(selected_batch.get("tipo_envio", "")) or "Sin clasificar"
+        llegada = safe_text(selected_batch.get("llegada_estimada", "")) or "-"
+        st.write(f"Tipo: {tipo}")
+        st.write(f"Llegada estimada: {llegada}")
+        if safe_text(selected_batch["status"]) != ORDER_DRAFT_STATUS:
+            st.info("Pedido confirmado. No se modifica desde el sistema.")
+        st.download_button(
+            "Descargar pedido guardado",
+            data=dataframe_to_excel_bytes(export_df, sheet_name="Pedido Mazda"),
+            file_name=f"pedido_mazda_{safe_text(selected_batch['nombre_lote']) or selected_batch_id}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            disabled=export_df.empty,
+            key=f"download_saved_order_{selected_batch_id}",
+        )
+
+
 def render_history_sections(empresa: str):
+    render_saved_factory_orders(empresa)
+
     st.subheader("Historial guardado")
     history_df = load_recent_runs(empresa)
     if history_df.empty:
         st.info("Todavia no hay corridas historicas guardadas para esta empresa.")
     else:
         st.dataframe(history_df, use_container_width=True, height=260)
-
-    st.subheader("Pedidos a fabrica registrados")
-    batches_df = load_recent_order_batches(empresa)
-    if batches_df.empty:
-        st.info("Todavia no hay pedidos a fabrica registrados en la base.")
-    else:
-        st.dataframe(batches_df, use_container_width=True, height=240)
 
 
 def render_final_order_upload_manager(
@@ -2465,8 +2522,8 @@ def render_final_order_upload_manager(
     suggested_order_df: pd.DataFrame,
     default_note: str = "",
 ):
-    st.subheader("Guardar pedido final enviado a Mazda")
-    st.caption("Descarga el sugerido, modificalo si hace falta y despues guarda el Excel final con el numero real de pedido Mazda.")
+    st.subheader("Enviar pedido a fabrica")
+    st.caption("Descarga el sugerido, modificalo si hace falta y despues envia el Excel final con el numero real de pedido Mazda. Al enviarlo queda guardado y bloqueado.")
 
     input_col_1, input_col_2 = st.columns([1, 2])
     order_number = input_col_1.text_input(
@@ -2512,7 +2569,7 @@ def render_final_order_upload_manager(
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"download_final_mazda_order_{analysis_month}",
     )
-    if action_col_2.button("Guardar pedido final en sistema", type="primary", key=f"save_final_mazda_order_{analysis_month}"):
+    if action_col_2.button("Enviar pedido a fabrica", type="primary", key=f"save_final_mazda_order_{analysis_month}"):
         try:
             batch_id, duplicated = save_final_mazda_order(
                 empresa=empresa,
@@ -2525,10 +2582,10 @@ def render_final_order_upload_manager(
             if duplicated:
                 st.warning(f"El pedido {classification['order_code']} ya estaba guardado como lote #{batch_id}.")
             else:
-                st.success(f"Pedido {classification['order_code']} guardado como lote #{batch_id}.")
+                st.success(f"Pedido {classification['order_code']} enviado a fabrica y guardado como lote #{batch_id}.")
             st.rerun()
         except Exception as exc:
-            st.error(f"No se pudo guardar el pedido final: {exc}")
+            st.error(f"No se pudo enviar el pedido a fabrica: {exc}")
 
 
 def main():
