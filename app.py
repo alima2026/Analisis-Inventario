@@ -7,9 +7,13 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
-import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
+
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    plt = None
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -26,11 +30,233 @@ AUTO_ORDER_FOLDER = APP_DIR / "Pedidos Solicitados"
 # Utilidades
 # =========================================================
 def normalize_part(value) -> str:
+    return parse_part_code(value)["display"]
+
+
+def _clean_part_text(value) -> str:
     if pd.isna(value):
         return ""
     text = str(value).strip().upper()
     text = re.sub(r"\s+", "", text)
     return text
+
+
+def _revision_rank(revision: str) -> int:
+    if isinstance(revision, str) and re.fullmatch(r"[A-Z]", revision):
+        return ord(revision) - ord("A") + 1
+    return 0
+
+
+def parse_part_code(value, allow_mazda_compact: bool = False) -> dict:
+    raw_text = _clean_part_text(value)
+    if not raw_text:
+        return {
+            "raw": "",
+            "display": "",
+            "key": "",
+            "revision": "",
+            "is_mazda": False,
+            "formatted": False,
+        }
+
+    text = raw_text
+    explicit_revision = ""
+    revision_match = re.search(r"\(([A-Z])\)$", text)
+    if revision_match:
+        explicit_revision = revision_match.group(1)
+        text = text[: revision_match.start()]
+
+    text = text.strip("-")
+    hyphen_match = re.fullmatch(r"([A-Z0-9]{4})-([A-Z0-9]{2})-([A-Z0-9]{3,5})", text)
+    if hyphen_match:
+        group_1, group_2, group_3 = hyphen_match.groups()
+        revision = explicit_revision
+        core_tail = group_3
+        if not revision and len(core_tail) >= 4 and core_tail[-1].isalpha():
+            revision = core_tail[-1]
+            core_tail = core_tail[:-1]
+
+        if len(core_tail) in (3, 4):
+            code_key = f"{group_1}-{group_2}-{core_tail}"
+            display = f"{code_key}{revision}"
+            return {
+                "raw": raw_text,
+                "display": display,
+                "key": code_key,
+                "revision": revision,
+                "is_mazda": True,
+                "formatted": raw_text != display,
+            }
+
+    compact_text = text.replace("-", "")
+    if explicit_revision or allow_mazda_compact:
+        compact_match = re.fullmatch(r"[A-Z0-9]{9,11}", compact_text)
+        if compact_match:
+            revision = explicit_revision
+            core_compact = compact_text
+            if not revision and len(core_compact) in (10, 11) and core_compact[-1].isalpha():
+                revision = core_compact[-1]
+                core_compact = core_compact[:-1]
+
+            if len(core_compact) in (9, 10):
+                code_key = f"{core_compact[:4]}-{core_compact[4:6]}-{core_compact[6:]}"
+                display = f"{code_key}{revision}"
+                return {
+                    "raw": raw_text,
+                    "display": display,
+                    "key": code_key,
+                    "revision": revision,
+                    "is_mazda": True,
+                    "formatted": raw_text != display,
+                }
+
+    return {
+        "raw": raw_text,
+        "display": raw_text,
+        "key": raw_text,
+        "revision": "",
+        "is_mazda": False,
+        "formatted": False,
+    }
+
+
+def normalize_part_key(value, allow_mazda_compact: bool = False) -> str:
+    return parse_part_code(value, allow_mazda_compact=allow_mazda_compact)["key"]
+
+
+def normalize_part_display(value, allow_mazda_compact: bool = False) -> str:
+    return parse_part_code(value, allow_mazda_compact=allow_mazda_compact)["display"]
+
+
+def choose_latest_part_code(values, allow_mazda_compact: bool = False) -> str:
+    infos = [
+        parse_part_code(value, allow_mazda_compact=allow_mazda_compact)
+        for value in values
+        if _clean_part_text(value)
+    ]
+    if not infos:
+        return ""
+
+    infos = sorted(
+        infos,
+        key=lambda item: (
+            1 if item["is_mazda"] else 0,
+            _revision_rank(item["revision"]),
+            item["display"],
+        ),
+    )
+    return infos[-1]["display"]
+
+
+def first_non_empty(values) -> str:
+    for value in values:
+        if pd.notna(value) and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def add_part_identity(df: pd.DataFrame, source_col: str, allow_mazda_compact: bool = False) -> pd.DataFrame:
+    out = df.copy()
+    parsed = out[source_col].map(lambda value: parse_part_code(value, allow_mazda_compact=allow_mazda_compact))
+    out["part_no"] = parsed.map(lambda item: item["display"])
+    out["part_key"] = parsed.map(lambda item: item["key"])
+    out["_part_raw_clean"] = parsed.map(lambda item: item["raw"])
+    out["_part_revision"] = parsed.map(lambda item: item["revision"])
+    out["_part_formatted"] = parsed.map(lambda item: item["formatted"])
+    return out
+
+
+def ensure_part_identity_columns(df: pd.DataFrame, allow_mazda_compact: bool = False) -> pd.DataFrame:
+    out = df.copy()
+    if "part_no" not in out.columns:
+        out["part_no"] = ""
+    has_part_key = "part_key" in out.columns
+    if not has_part_key:
+        out["part_key"] = out["part_no"].map(lambda value: normalize_part_key(value, allow_mazda_compact=allow_mazda_compact))
+        out["part_no"] = out["part_no"].map(lambda value: normalize_part_display(value, allow_mazda_compact=allow_mazda_compact))
+    else:
+        out["part_key"] = out["part_key"].fillna("").astype(str).str.strip()
+        missing_key = out["part_key"].eq("")
+        if missing_key.any():
+            out.loc[missing_key, "part_key"] = out.loc[missing_key, "part_no"].map(
+                lambda value: normalize_part_key(value, allow_mazda_compact=allow_mazda_compact)
+            )
+            out.loc[missing_key, "part_no"] = out.loc[missing_key, "part_no"].map(
+                lambda value: normalize_part_display(value, allow_mazda_compact=allow_mazda_compact)
+            )
+        out["part_no"] = out["part_no"].fillna("").astype(str).str.strip()
+    return out
+
+
+def _format_qty(value) -> str:
+    qty = float(value or 0)
+    if qty.is_integer():
+        return str(int(qty))
+    return f"{qty:g}"
+
+
+def build_code_unification_report(
+    df: pd.DataFrame,
+    source_label: str,
+    qty_col: str,
+    allow_mazda_compact: bool = True,
+) -> pd.DataFrame:
+    columns = ["origen", "codigo_base", "codigo_unificado", "variantes_detectadas", "cantidad_total"]
+    if df.empty or "part_key" not in df.columns or qty_col not in df.columns:
+        return pd.DataFrame(columns=columns)
+
+    rows = []
+    tmp = df[df["part_key"].astype(str).str.strip() != ""].copy()
+    for part_key, group in tmp.groupby("part_key", dropna=False):
+        display_qty = (
+            group.groupby("part_no", dropna=False)[qty_col]
+            .sum()
+            .reset_index()
+            .sort_values("part_no")
+        )
+        displays = [value for value in display_qty["part_no"].astype(str).tolist() if value]
+        if len(set(displays)) <= 1:
+            continue
+
+        unified_code = choose_latest_part_code(displays, allow_mazda_compact=allow_mazda_compact)
+        detail = ", ".join(
+            f"{row['part_no']}={_format_qty(row[qty_col])}"
+            for _, row in display_qty.iterrows()
+            if str(row["part_no"]).strip()
+        )
+        rows.append(
+            {
+                "origen": source_label,
+                "codigo_base": part_key,
+                "codigo_unificado": unified_code,
+                "variantes_detectadas": detail,
+                "cantidad_total": float(display_qty[qty_col].sum()),
+            }
+        )
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def collect_code_unification_reports(*frames: pd.DataFrame) -> pd.DataFrame:
+    reports = []
+    for frame in frames:
+        report = frame.attrs.get("code_unifications") if isinstance(frame, pd.DataFrame) else None
+        if isinstance(report, pd.DataFrame) and not report.empty:
+            reports.append(report)
+
+    if not reports:
+        return pd.DataFrame(
+            columns=["origen", "codigo_base", "codigo_unificado", "variantes_detectadas", "cantidad_total"]
+        )
+    return pd.concat(reports, ignore_index=True)
+
+
+def count_formatted_codes(*frames: pd.DataFrame) -> int:
+    total = 0
+    for frame in frames:
+        if isinstance(frame, pd.DataFrame):
+            total += int(frame.attrs.get("formatted_code_count", 0) or 0)
+    return total
 
 
 def safe_numeric(series: pd.Series) -> pd.Series:
@@ -49,7 +275,7 @@ def detect_brand(part_no: str, description: str = "") -> str:
     part = normalize_part(part_no)
     description_text = str(description).upper().strip()
 
-    if re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{2}-[A-Z0-9]{3}[A-Z]?", part):
+    if re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{2}-[A-Z0-9]{3,4}[A-Z]?", part):
         return "Mazda"
     if re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{4}[A-Z]?", part):
         return "Mazda"
@@ -254,7 +480,7 @@ def load_sales(uploaded_file) -> pd.DataFrame:
     ]
 
     df = df.copy()
-    df["part_no"] = df["part_no"].map(normalize_part)
+    df = add_part_identity(df, "part_no", allow_mazda_compact=False)
     df["description"] = df["description"].astype(str).str.strip()
 
     for col in [
@@ -269,8 +495,19 @@ def load_sales(uploaded_file) -> pd.DataFrame:
     ]:
         df[col] = safe_numeric(df[col])
 
-    df = df[df["part_no"] != ""].copy()
+    df = df[df["part_key"] != ""].copy()
     df["brand"] = df.apply(lambda row: detect_brand(row["part_no"], row["description"]), axis=1)
+    df = (
+        df.groupby("part_key", as_index=False)
+        .agg(
+            part_no=("part_no", lambda values: choose_latest_part_code(values)),
+            description=("description", first_non_empty),
+            brand=("brand", first_non_empty),
+            sales_units=("sales_units", "sum"),
+            sales_uyu=("sales_uyu", "sum"),
+            cost_uyu=("cost_uyu", "sum"),
+        )
+    )
     df["avg_monthly_units"] = df["sales_units"] / 36.0
     df["avg_annual_units"] = df["sales_units"] / 3.0
     df["avg_monthly_sales_uyu"] = df["sales_uyu"] / 36.0
@@ -282,12 +519,20 @@ def load_inventory(uploaded_file) -> pd.DataFrame:
     df = raw.iloc[5:, [2, 8, 16, 20]].copy()
     df.columns = ["part_no", "description", "unit", "stock"]
     df = df.dropna(subset=["part_no"]).copy()
-    df["part_no"] = df["part_no"].map(normalize_part)
+    df = add_part_identity(df, "part_no", allow_mazda_compact=False)
     df["description"] = df["description"].astype(str).str.strip()
     df["stock"] = safe_numeric(df["stock"])
-    df = df[df["part_no"] != ""].copy()
+    df = df[df["part_key"] != ""].copy()
     df["brand"] = df.apply(lambda row: detect_brand(row["part_no"], row["description"]), axis=1)
-    return df.groupby(["part_no", "description", "brand"], as_index=False)["stock"].sum()
+    return (
+        df.groupby("part_key", as_index=False)
+        .agg(
+            part_no=("part_no", lambda values: choose_latest_part_code(values)),
+            description=("description", first_non_empty),
+            brand=("brand", first_non_empty),
+            stock=("stock", "sum"),
+        )
+    )
 
 
 def load_backorder(uploaded_file) -> pd.DataFrame:
@@ -297,7 +542,7 @@ def load_backorder(uploaded_file) -> pd.DataFrame:
     part_col = "Buyer Part" if "Buyer Part" in df.columns else "Seller Part"
     desc_col = "Description" if "Description" in df.columns else None
 
-    df["part_no"] = df[part_col].map(normalize_part)
+    df = add_part_identity(df, part_col, allow_mazda_compact=True)
     df["description"] = df[desc_col].astype(str).str.strip() if desc_col else ""
 
     numeric_cols = [
@@ -321,9 +566,22 @@ def load_backorder(uploaded_file) -> pd.DataFrame:
         if col in df.columns:
             df["backorder_qty"] += df[col]
 
-    df = df[df["part_no"] != ""].copy()
+    df = df[df["part_key"] != ""].copy()
     df["brand"] = df.apply(lambda row: detect_brand(row["part_no"], row["description"]), axis=1)
-    return df.groupby(["part_no", "description", "brand"], as_index=False)["backorder_qty"].sum()
+    report = build_code_unification_report(df, "Backorder", "backorder_qty", allow_mazda_compact=True)
+    formatted_count = int(df["_part_formatted"].sum())
+    out = (
+        df.groupby("part_key", as_index=False)
+        .agg(
+            part_no=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
+            description=("description", first_non_empty),
+            brand=("brand", first_non_empty),
+            backorder_qty=("backorder_qty", "sum"),
+        )
+    )
+    out.attrs["code_unifications"] = report
+    out.attrs["formatted_code_count"] = formatted_count
+    return out
 
 
 def load_monthly_order(uploaded_file) -> pd.DataFrame:
@@ -334,10 +592,18 @@ def load_monthly_order(uploaded_file) -> pd.DataFrame:
     qty_col = "PCS" if "PCS" in df.columns else df.columns[1]
     order_no_col = "ORDER NO" if "ORDER NO" in df.columns else None
 
-    df["part_no"] = df[part_col].map(normalize_part)
+    df = add_part_identity(df, part_col, allow_mazda_compact=True)
     df["monthly_order_qty"] = safe_numeric(df[qty_col])
-    df = df[df["part_no"] != ""].copy()
-    order_summary = df.groupby("part_no", as_index=False)["monthly_order_qty"].sum()
+    df = df[df["part_key"] != ""].copy()
+    report = build_code_unification_report(df, "Pedido a fabrica", "monthly_order_qty", allow_mazda_compact=True)
+    formatted_count = int(df["_part_formatted"].sum())
+    order_summary = (
+        df.groupby("part_key", as_index=False)
+        .agg(
+            part_no=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
+            monthly_order_qty=("monthly_order_qty", "sum"),
+        )
+    )
 
     order_code = ""
     if order_no_col and order_no_col in df.columns:
@@ -347,11 +613,13 @@ def load_monthly_order(uploaded_file) -> pd.DataFrame:
 
     order_summary.attrs["order_code"] = order_code if order_code else Path(uploaded_file.name).stem
     order_summary.attrs["source_file_name"] = uploaded_file.name
+    order_summary.attrs["code_unifications"] = report
+    order_summary.attrs["formatted_code_count"] = formatted_count
     return order_summary
 
 
 def empty_monthly_order(source_name: str = "Sin pedido a fabrica") -> pd.DataFrame:
-    df = pd.DataFrame(columns=["part_no", "monthly_order_qty"])
+    df = pd.DataFrame(columns=["part_key", "part_no", "monthly_order_qty"])
     df.attrs["order_code"] = ""
     df.attrs["source_file_name"] = source_name
     return df
@@ -385,8 +653,14 @@ def build_mazda_order_to_request(pedido_inteligente: pd.DataFrame) -> pd.DataFra
 # Motor principal
 # =========================================================
 def merge_all(sales: pd.DataFrame, stock: pd.DataFrame, backorder: pd.DataFrame, order: pd.DataFrame) -> pd.DataFrame:
+    sales = ensure_part_identity_columns(sales, allow_mazda_compact=False)
+    stock = ensure_part_identity_columns(stock, allow_mazda_compact=False)
+    backorder = ensure_part_identity_columns(backorder, allow_mazda_compact=True)
+    order = ensure_part_identity_columns(order, allow_mazda_compact=True)
+
     sales_base = sales[
         [
+            "part_key",
             "part_no",
             "description",
             "brand",
@@ -397,23 +671,27 @@ def merge_all(sales: pd.DataFrame, stock: pd.DataFrame, backorder: pd.DataFrame,
             "avg_annual_units",
             "avg_monthly_sales_uyu",
         ]
-    ].copy()
+    ].rename(columns={"part_no": "part_no_sales"}).copy()
 
-    stock_base = stock[["part_no", "description", "brand", "stock"]].rename(
-        columns={"description": "description_stock", "brand": "brand_stock"}
+    stock_base = stock[["part_key", "part_no", "description", "brand", "stock"]].rename(
+        columns={"part_no": "part_no_stock", "description": "description_stock", "brand": "brand_stock"}
     )
-    backorder_base = backorder[["part_no", "description", "brand", "backorder_qty"]].rename(
-        columns={"description": "description_backorder", "brand": "brand_backorder"}
+    backorder_base = backorder[["part_key", "part_no", "description", "brand", "backorder_qty"]].rename(
+        columns={"part_no": "part_no_backorder", "description": "description_backorder", "brand": "brand_backorder"}
     )
-    order_base = order[["part_no", "monthly_order_qty"]].copy()
+    order_base = order[["part_key", "part_no", "monthly_order_qty"]].rename(columns={"part_no": "part_no_order"}).copy()
 
     merged = (
-        sales_base.merge(stock_base, on="part_no", how="outer")
-        .merge(backorder_base, on="part_no", how="outer")
-        .merge(order_base, on="part_no", how="outer")
+        sales_base.merge(stock_base, on="part_key", how="outer")
+        .merge(backorder_base, on="part_key", how="outer")
+        .merge(order_base, on="part_key", how="outer")
     )
 
-    merged["part_no"] = merged["part_no"].fillna("").map(normalize_part)
+    part_source_cols = ["part_no_sales", "part_no_stock", "part_no_backorder", "part_no_order"]
+    merged["part_no"] = merged[part_source_cols].apply(
+        lambda row: choose_latest_part_code(row.tolist(), allow_mazda_compact=True),
+        axis=1,
+    )
     merged["description"] = merged["description"].fillna("")
     merged["brand"] = merged["brand"].fillna("")
 
@@ -454,7 +732,18 @@ def merge_all(sales: pd.DataFrame, stock: pd.DataFrame, backorder: pd.DataFrame,
         errors="coerce",
     ).fillna(0.0)
 
-    merged = merged.drop(columns=["description_stock", "brand_stock", "description_backorder", "brand_backorder"])
+    merged = merged.drop(
+        columns=[
+            "part_no_sales",
+            "part_no_stock",
+            "part_no_backorder",
+            "part_no_order",
+            "description_stock",
+            "brand_stock",
+            "description_backorder",
+            "brand_backorder",
+        ]
+    )
     return merged
 
 
@@ -600,7 +889,15 @@ def build_analysis_dataframe(
     if open_orders_df is None or open_orders_df.empty:
         final_df["open_order_qty_db"] = 0.0
     else:
-        final_df = final_df.merge(open_orders_df[["part_no", "open_order_qty_db"]], on="part_no", how="left")
+        open_orders_base = ensure_part_identity_columns(open_orders_df, allow_mazda_compact=True)[
+            ["part_key", "part_no", "open_order_qty_db"]
+        ].rename(columns={"part_no": "part_no_open"})
+        final_df = final_df.merge(open_orders_base, on="part_key", how="left")
+        final_df["part_no"] = final_df[["part_no", "part_no_open"]].apply(
+            lambda row: choose_latest_part_code(row.tolist(), allow_mazda_compact=True),
+            axis=1,
+        )
+        final_df = final_df.drop(columns=["part_no_open"])
         final_df["open_order_qty_db"] = pd.to_numeric(final_df["open_order_qty_db"], errors="coerce").fillna(0.0)
 
     final_df["pipeline_qty"] = final_df["backorder_qty"] + final_df["monthly_order_qty"] + final_df["open_order_qty_db"]
@@ -937,11 +1234,18 @@ def create_order_batch(
     if existing:
         return existing["id"], True
 
-    order_enriched = order_df.merge(
-        final_df[["part_no", "description", "brand"]].drop_duplicates("part_no"),
-        on="part_no",
+    order_base = ensure_part_identity_columns(order_df, allow_mazda_compact=True)
+    final_base = ensure_part_identity_columns(final_df, allow_mazda_compact=True)
+    order_enriched = order_base.merge(
+        final_base[["part_key", "part_no", "description", "brand"]].drop_duplicates("part_key"),
+        on="part_key",
         how="left",
+        suffixes=("_order", ""),
     ).copy()
+    order_enriched["part_no"] = order_enriched[["part_no", "part_no_order"]].apply(
+        lambda row: choose_latest_part_code(row.tolist(), allow_mazda_compact=True),
+        axis=1,
+    )
     order_enriched["description"] = order_enriched["description"].fillna("")
     order_enriched["brand"] = order_enriched["brand"].fillna("")
 
@@ -1330,6 +1634,24 @@ def load_run_items(run_id: int) -> pd.DataFrame:
             conn,
             params=(run_id,),
         )
+    if df.empty:
+        df["part_key"] = []
+        return df
+
+    df = ensure_part_identity_columns(df, allow_mazda_compact=False)
+    df = (
+        df.groupby("part_key", as_index=False)
+        .agg(
+            part_no=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
+            description=("description", first_non_empty),
+            brand=("brand", first_non_empty),
+            sales_units=("sales_units", "sum"),
+            avg_monthly_units=("avg_monthly_units", "sum"),
+            stock=("stock", "sum"),
+            backorder_qty=("backorder_qty", "sum"),
+            monthly_order_qty=("monthly_order_qty", "sum"),
+        )
+    )
     return df
 
 
@@ -1338,7 +1660,7 @@ def load_open_factory_orders_by_part(empresa: str, exclude_order_file_hash: Opti
     query = """
         SELECT
             i.part_no,
-            ROUND(COALESCE(SUM(i.open_qty), 0), 2) AS open_order_qty_db
+            COALESCE(i.open_qty, 0) AS open_order_qty_db
         FROM factory_order_items i
         INNER JOIN factory_order_batches b ON b.id = i.batch_id
         WHERE b.empresa = ?
@@ -1350,12 +1672,21 @@ def load_open_factory_orders_by_part(empresa: str, exclude_order_file_hash: Opti
         query += " AND COALESCE(b.order_file_hash, '') <> ?"
         params.append(exclude_order_file_hash)
 
-    query += " GROUP BY i.part_no"
-
     with get_connection() as conn:
         df = pd.read_sql_query(query, conn, params=params)
 
-    return df
+    if df.empty:
+        return pd.DataFrame(columns=["part_key", "part_no", "open_order_qty_db"])
+
+    df = ensure_part_identity_columns(df, allow_mazda_compact=True)
+    df = df[df["part_key"] != ""].copy()
+    return (
+        df.groupby("part_key", as_index=False)
+        .agg(
+            part_no=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
+            open_order_qty_db=("open_order_qty_db", "sum"),
+        )
+    )
 
 
 def load_order_history_by_part(empresa: str) -> pd.DataFrame:
@@ -1364,22 +1695,63 @@ def load_order_history_by_part(empresa: str) -> pd.DataFrame:
             """
             SELECT
                 i.part_no,
-                ROUND(COALESCE(SUM(i.quantity), 0), 2) AS ordered_total_db,
-                ROUND(COALESCE(SUM(i.received_qty), 0), 2) AS received_total_db,
-                ROUND(COALESCE(SUM(i.open_qty), 0), 2) AS open_order_qty_db,
-                MAX(b.created_at) AS last_order_at,
-                MAX(COALESCE(b.order_code, b.order_name)) AS last_order_code,
-                COUNT(DISTINCT b.id) AS order_batches_db
+                COALESCE(i.quantity, 0) AS ordered_total_db,
+                COALESCE(i.received_qty, 0) AS received_total_db,
+                COALESCE(i.open_qty, 0) AS open_order_qty_db,
+                b.created_at AS last_order_at,
+                COALESCE(b.order_code, b.order_name) AS last_order_code,
+                b.id AS batch_id
             FROM factory_order_items i
             INNER JOIN factory_order_batches b ON b.id = i.batch_id
             WHERE b.empresa = ?
               AND b.status <> 'CANCELADO'
-            GROUP BY i.part_no
             """,
             conn,
             params=(empresa,),
         )
-    return df
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "part_key",
+                "part_no",
+                "ordered_total_db",
+                "received_total_db",
+                "open_order_qty_db",
+                "last_order_at",
+                "last_order_code",
+                "order_batches_db",
+            ]
+        )
+
+    df = ensure_part_identity_columns(df, allow_mazda_compact=True)
+    df = df[df["part_key"] != ""].copy()
+    latest_codes = df.groupby("part_key")["part_no"].agg(
+        lambda values: choose_latest_part_code(values, allow_mazda_compact=True)
+    )
+    grouped = (
+        df.groupby("part_key", as_index=False)
+        .agg(
+            ordered_total_db=("ordered_total_db", "sum"),
+            received_total_db=("received_total_db", "sum"),
+            open_order_qty_db=("open_order_qty_db", "sum"),
+            last_order_at=("last_order_at", "max"),
+            last_order_code=("last_order_code", first_non_empty),
+            order_batches_db=("batch_id", "nunique"),
+        )
+    )
+    grouped["part_no"] = grouped["part_key"].map(latest_codes)
+    return grouped[
+        [
+            "part_key",
+            "part_no",
+            "ordered_total_db",
+            "received_total_db",
+            "open_order_qty_db",
+            "last_order_at",
+            "last_order_code",
+            "order_batches_db",
+        ]
+    ]
 
 
 def refresh_batch_status(conn, batch_id: int):
@@ -1427,28 +1799,45 @@ def reconcile_open_orders_with_inventory(
     if receipts_df.empty:
         return
 
+    open_items = conn.execute(
+        """
+        SELECT
+            i.id,
+            i.batch_id,
+            i.part_no,
+            COALESCE(i.received_qty, 0) AS received_qty,
+            COALESCE(i.open_qty, i.quantity) AS open_qty
+        FROM factory_order_items i
+        INNER JOIN factory_order_batches b ON b.id = i.batch_id
+        WHERE b.empresa = ?
+          AND b.status <> 'CANCELADO'
+          AND COALESCE(i.open_qty, 0) > 0
+        ORDER BY b.created_at ASC, i.id ASC
+        """,
+        (empresa,),
+    ).fetchall()
+
+    open_items_by_key = {}
+    for item in open_items:
+        part_key = normalize_part_key(item["part_no"], allow_mazda_compact=True)
+        if not part_key:
+            continue
+        open_items_by_key.setdefault(part_key, []).append(
+            {
+                "id": item["id"],
+                "batch_id": item["batch_id"],
+                "received_qty": float(item["received_qty"] or 0),
+                "open_qty": float(item["open_qty"] or 0),
+            }
+        )
+
     for _, row in receipts_df.iterrows():
         remaining_qty = float(row["estimated_receipts_qty"])
         if remaining_qty <= 0:
             continue
 
-        open_items = conn.execute(
-            """
-            SELECT
-                i.id,
-                i.batch_id,
-                COALESCE(i.received_qty, 0) AS received_qty,
-                COALESCE(i.open_qty, i.quantity) AS open_qty
-            FROM factory_order_items i
-            INNER JOIN factory_order_batches b ON b.id = i.batch_id
-            WHERE b.empresa = ?
-              AND b.status <> 'CANCELADO'
-              AND i.part_no = ?
-              AND COALESCE(i.open_qty, 0) > 0
-            ORDER BY b.created_at ASC, i.id ASC
-            """,
-            (empresa, safe_text(row["part_no"])),
-        ).fetchall()
+        row_part_key = normalize_part_key(row["part_no"], allow_mazda_compact=True)
+        open_items = open_items_by_key.get(row_part_key, [])
 
         for item in open_items:
             if remaining_qty <= 0:
@@ -1472,6 +1861,8 @@ def reconcile_open_orders_with_inventory(
                 (new_received_qty, new_open_qty, created_at, new_status, item["id"]),
             )
             refresh_batch_status(conn, item["batch_id"])
+            item["open_qty"] = new_open_qty
+            item["received_qty"] = new_received_qty
             remaining_qty -= inferred_received
 
 
@@ -1530,7 +1921,13 @@ def add_historical_context(
     else:
         order_history = order_history.rename(columns={"open_order_qty_db": "open_order_total_db"})
 
-    out = out.merge(order_history, on="part_no", how="left")
+    out = ensure_part_identity_columns(out, allow_mazda_compact=True)
+    order_history = ensure_part_identity_columns(order_history, allow_mazda_compact=True)
+    out = out.merge(
+        order_history.drop(columns=["part_no"], errors="ignore"),
+        on="part_key",
+        how="left",
+    )
     out["ordered_total_db"] = pd.to_numeric(out["ordered_total_db"], errors="coerce").fillna(0.0)
     out["received_total_db"] = pd.to_numeric(out["received_total_db"], errors="coerce").fillna(0.0)
     if "open_order_qty_db" not in out.columns:
@@ -1566,9 +1963,10 @@ def add_historical_context(
         }
     )
 
+    previous_items = ensure_part_identity_columns(previous_items, allow_mazda_compact=True)
     out = out.merge(
-        previous_items[["part_no", "stock_prev", "backorder_prev", "avg_monthly_units_prev"]],
-        on="part_no",
+        previous_items[["part_key", "stock_prev", "backorder_prev", "avg_monthly_units_prev"]],
+        on="part_key",
         how="left",
     )
 
@@ -1749,9 +2147,24 @@ def main():
             analysis_date=analysis_date,
             current_source_hash=source_hash,
         )
+        code_unification_report = collect_code_unification_reports(backorder_df, order_df)
+        formatted_code_count = count_formatted_codes(backorder_df, order_df)
     except Exception as exc:
         st.error(f"Error procesando archivos: {exc}")
         st.stop()
+
+    if formatted_code_count:
+        st.info(
+            f"Se normalizaron {formatted_code_count} codigos de Backorder/Pedido a fabrica "
+            "con guiones o letras de modificacion."
+        )
+
+    if not code_unification_report.empty:
+        st.warning(
+            "Se detectaron codigos equivalentes con distinta letra de modificacion. "
+            "El sistema sumo las cantidades y dejo la letra mas nueva."
+        )
+        st.dataframe(code_unification_report, use_container_width=True, hide_index=True)
 
     action_col_1, action_col_2 = st.columns([2, 5])
     if action_col_1.button("Guardar corrida en base", type="primary"):
@@ -1812,9 +2225,13 @@ def main():
         view = view[view["abc"] == selected_abc]
     if search_text:
         term = search_text.strip().upper()
+        term_key = normalize_part_key(term, allow_mazda_compact=True)
+        term_display = normalize_part_display(term, allow_mazda_compact=True)
         view = view[
-            view["part_no"].astype(str).str.upper().str.contains(term, na=False)
-            | view["description"].astype(str).str.upper().str.contains(term, na=False)
+            view["part_no"].astype(str).str.upper().str.contains(term, na=False, regex=False)
+            | view["part_no"].astype(str).str.upper().str.contains(term_display, na=False, regex=False)
+            | view["part_key"].astype(str).str.upper().str.contains(term_key, na=False, regex=False)
+            | view["description"].astype(str).str.upper().str.contains(term, na=False, regex=False)
         ]
 
     metric_col_1, metric_col_2, metric_col_3, metric_col_4, metric_col_5, metric_col_6 = st.columns(6)
@@ -1879,15 +2296,18 @@ def main():
     )
 
     if not top_sales.empty:
-        fig, ax = plt.subplots(figsize=(10, 5))
         plot_df = top_sales.head(15)
-        ax.bar(plot_df["part_no"], plot_df["sales_units"])
-        ax.set_title("Top 15 por unidades vendidas")
-        ax.set_xlabel("Codigo")
-        ax.set_ylabel("Unidades")
-        ax.tick_params(axis="x", rotation=60)
-        fig.tight_layout()
-        st.pyplot(fig)
+        if plt is not None:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.bar(plot_df["part_no"], plot_df["sales_units"])
+            ax.set_title("Top 15 por unidades vendidas")
+            ax.set_xlabel("Codigo")
+            ax.set_ylabel("Unidades")
+            ax.tick_params(axis="x", rotation=60)
+            fig.tight_layout()
+            st.pyplot(fig)
+        else:
+            st.bar_chart(plot_df.set_index("part_no")["sales_units"])
 
     st.subheader("Pedido inteligente")
     pedido_inteligente = view[view["selected_for_purchase"]].copy()
@@ -2057,6 +2477,7 @@ def main():
             "ofertas": ofertas_df[detail_cols],
             "resumen_marca": summary_brand,
             "resumen_abc": summary_abc,
+            "codigos_unificados": code_unification_report,
             "historial_corridas": history_export_df,
             "lotes_pedidos": batches_export_df,
             "detalle_completo": view[detail_cols],
