@@ -2852,14 +2852,19 @@ def main():
             | view["description"].astype(str).str.upper().str.contains(term, na=False, regex=False)
         ]
 
-    metric_col_1, metric_col_2, metric_col_3, metric_col_4, metric_col_5, metric_col_6, metric_col_7 = st.columns(7)
-    metric_col_1.metric("Articulos", f"{len(view):,}")
-    metric_col_2.metric("Art. stock muerto", f"{int(view['stock_muerto'].sum()):,}")
-    metric_col_3.metric("Art. ofertas", f"{int(view['oferta_sugerida'].sum()):,}")
-    metric_col_4.metric("Unid. pedido archivo", f"{int(view['monthly_order_qty'].sum()):,}")
-    metric_col_5.metric("Art. sugeridos", f"{int((view['suggested_order_qty'] > 0).sum()):,}")
-    metric_col_6.metric("Unid. sugeridas", f"{int(view['suggested_order_qty'].sum()):,}")
-    metric_col_7.metric("Unid. abierto DB", f"{int(view['open_order_qty_db'].sum()):,}")
+    stock_dead_units = int(view.loc[view["stock_muerto"], "stock"].sum())
+
+    metric_top_1, metric_top_2, metric_top_3, metric_top_4 = st.columns(4)
+    metric_top_1.metric("Articulos", f"{len(view):,}")
+    metric_top_2.metric("Art. stock muerto", f"{int(view['stock_muerto'].sum()):,}")
+    metric_top_3.metric("Unid. stock muerto", f"{stock_dead_units:,}")
+    metric_top_4.metric("Art. ofertas", f"{int(view['oferta_sugerida'].sum()):,}")
+
+    metric_bottom_1, metric_bottom_2, metric_bottom_3, metric_bottom_4 = st.columns(4)
+    metric_bottom_1.metric("Unid. pedido archivo", f"{int(view['monthly_order_qty'].sum()):,}")
+    metric_bottom_2.metric("Art. sugeridos compra", f"{int((view['suggested_order_qty'] > 0).sum()):,}")
+    metric_bottom_3.metric("Unid. sugeridas compra", f"{int(view['suggested_order_qty'].sum()):,}")
+    metric_bottom_4.metric("Unid. abierto DB", f"{int(view['open_order_qty_db'].sum()):,}")
 
     st.subheader("Detalle compra sugerida")
     suggested_detail = view[view["suggested_order_qty"] > 0].copy()
