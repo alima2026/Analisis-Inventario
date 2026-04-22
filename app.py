@@ -620,10 +620,21 @@ def build_source_hash(
 # =========================================================
 def load_sales(uploaded_file) -> pd.DataFrame:
     df = pd.read_excel(uploaded_file, header=[0, 1])
-    if df.shape[1] < 13:
-        raise ValueError("El archivo de ventas no tiene el formato esperado.")
 
-    df.columns = [
+    expected_markers = {"PRODUCTO", "UNIDADES", "VENTAS", "COSTO"}
+    header_text = " ".join(
+        str(part).strip().upper()
+        for col in df.columns
+        for part in (col if isinstance(col, tuple) else [col])
+    )
+    if not all(marker in header_text for marker in expected_markers):
+        file_name = getattr(uploaded_file, "name", "archivo cargado")
+        raise ValueError(
+            f"El archivo cargado como Ventas 3 anios no parece ser el archivo de ventas. "
+            f"Revisa que no hayas cargado Inventario, Backorder o Pedido a fabrica en ese casillero. Archivo: {file_name}"
+        )
+
+    sales_columns = [
         "part_no",
         "description",
         "unit",
@@ -638,6 +649,11 @@ def load_sales(uploaded_file) -> pd.DataFrame:
         "cost_usd",
         "cost_pct",
     ]
+    if df.shape[1] < len(sales_columns):
+        raise ValueError("El archivo de ventas no tiene el formato esperado.")
+
+    df = df.iloc[:, : len(sales_columns)].copy()
+    df.columns = sales_columns
 
     df = df.copy()
     df = add_part_identity(df, "part_no", allow_mazda_compact=False)
@@ -656,6 +672,10 @@ def load_sales(uploaded_file) -> pd.DataFrame:
         df[col] = safe_numeric(df[col])
 
     df = df[df["part_key"] != ""].copy()
+    if df.empty:
+        file_name = getattr(uploaded_file, "name", "archivo cargado")
+        raise ValueError(f"No se encontraron codigos validos en el archivo de ventas: {file_name}")
+
     df["brand"] = df.apply(lambda row: detect_brand(row["part_no"], row["description"]), axis=1)
     df = (
         df.groupby("part_key", as_index=False)
