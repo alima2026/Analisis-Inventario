@@ -62,10 +62,15 @@ def parse_part_code(value, allow_mazda_compact: bool = False) -> dict:
             "key": "",
             "revision": "",
             "is_mazda": False,
+            "is_plaza": False,
             "formatted": False,
         }
 
     text = raw_text
+    is_plaza = text.endswith("*")
+    if is_plaza:
+        text = text[:-1]
+
     explicit_revision = ""
     revision_match = re.search(r"\(([A-Z])\)$", text)
     if revision_match:
@@ -84,13 +89,14 @@ def parse_part_code(value, allow_mazda_compact: bool = False) -> dict:
 
         if len(core_tail) in (3, 4):
             code_key = f"{group_1}-{group_2}-{core_tail}"
-            display = f"{code_key}{revision}"
+            display = f"{code_key}{revision}{'*' if is_plaza else ''}"
             return {
                 "raw": raw_text,
                 "display": display,
                 "key": code_key,
                 "revision": revision,
                 "is_mazda": True,
+                "is_plaza": is_plaza,
                 "formatted": raw_text != display,
             }
 
@@ -106,13 +112,14 @@ def parse_part_code(value, allow_mazda_compact: bool = False) -> dict:
 
             if len(core_compact) in (9, 10):
                 code_key = f"{core_compact[:4]}-{core_compact[4:6]}-{core_compact[6:]}"
-                display = f"{code_key}{revision}"
+                display = f"{code_key}{revision}{'*' if is_plaza else ''}"
                 return {
                     "raw": raw_text,
                     "display": display,
                     "key": code_key,
                     "revision": revision,
                     "is_mazda": True,
+                    "is_plaza": is_plaza,
                     "formatted": raw_text != display,
                 }
 
@@ -122,6 +129,7 @@ def parse_part_code(value, allow_mazda_compact: bool = False) -> dict:
         "key": raw_text,
         "revision": "",
         "is_mazda": False,
+        "is_plaza": is_plaza,
         "formatted": False,
     }
 
@@ -920,6 +928,8 @@ def add_inventory_logic(df: pd.DataFrame, target_months: int, lead_time_months: 
     out["suggested_order_qty"] = (out["target_stock_qty"] - out["available_plus_pipeline"]).clip(lower=0).apply(math.ceil)
 
     def define_status(row):
+        if row["backorder_qty"] > 0:
+            return "Backorder"
         if row["sales_units"] <= 0 and row["stock"] > 0:
             return "Stock muerto"
         if row["sales_units"] <= 0 and row["stock"] <= 0:
@@ -958,6 +968,7 @@ def add_intelligent_order(df: pd.DataFrame, capital: float) -> pd.DataFrame:
     status_score = {
         "Critico": 100,
         "Comprar ya": 80,
+        "Backorder": 70,
         "Comprar": 60,
         "OK": 20,
         "Sin historial": 10,
@@ -2821,13 +2832,61 @@ def main():
             | view["description"].astype(str).str.upper().str.contains(term, na=False, regex=False)
         ]
 
-    metric_col_1, metric_col_2, metric_col_3, metric_col_4, metric_col_5, metric_col_6 = st.columns(6)
-    metric_col_1.metric("Items", f"{len(view):,}")
-    metric_col_2.metric("Stock muerto", f"{int(view['stock_muerto'].sum()):,}")
-    metric_col_3.metric("Ofertas", f"{int(view['oferta_sugerida'].sum()):,}")
-    metric_col_4.metric("Pedido archivo", f"{int(view['monthly_order_qty'].sum()):,}")
-    metric_col_5.metric("Compra sugerida", f"{int(view['suggested_order_qty'].sum()):,}")
-    metric_col_6.metric("Abierto DB", f"{int(view['open_order_qty_db'].sum()):,}")
+    metric_col_1, metric_col_2, metric_col_3, metric_col_4, metric_col_5, metric_col_6, metric_col_7 = st.columns(7)
+    metric_col_1.metric("Articulos", f"{len(view):,}")
+    metric_col_2.metric("Art. stock muerto", f"{int(view['stock_muerto'].sum()):,}")
+    metric_col_3.metric("Art. ofertas", f"{int(view['oferta_sugerida'].sum()):,}")
+    metric_col_4.metric("Unid. pedido archivo", f"{int(view['monthly_order_qty'].sum()):,}")
+    metric_col_5.metric("Art. sugeridos", f"{int((view['suggested_order_qty'] > 0).sum()):,}")
+    metric_col_6.metric("Unid. sugeridas", f"{int(view['suggested_order_qty'].sum()):,}")
+    metric_col_7.metric("Unid. abierto DB", f"{int(view['open_order_qty_db'].sum()):,}")
+
+    st.subheader("Detalle compra sugerida")
+    suggested_detail = view[view["suggested_order_qty"] > 0].copy()
+    if suggested_detail.empty:
+        st.info("No hay articulos con compra sugerida para los filtros actuales.")
+    else:
+        suggested_detail = suggested_detail.sort_values(
+            ["smart_score", "suggested_order_qty", "sales_units"],
+            ascending=[False, False, False],
+        )
+        suggested_cols = [
+            "part_no",
+            "description",
+            "brand",
+            "abc",
+            "status",
+            "sales_units",
+            "stock",
+            "backorder_qty",
+            "monthly_order_qty",
+            "open_order_qty_db",
+            "available_plus_pipeline",
+            "target_stock_qty",
+            "suggested_order_qty",
+        ]
+        suggested_view = suggested_detail[suggested_cols].rename(
+            columns={
+                "part_no": "codigo",
+                "description": "descripcion",
+                "brand": "marca",
+                "status": "estado",
+                "sales_units": "ventas_3_anios",
+                "backorder_qty": "backorder",
+                "monthly_order_qty": "pedido_archivo",
+                "open_order_qty_db": "abierto_db",
+                "available_plus_pipeline": "stock_mas_pedidos",
+                "target_stock_qty": "stock_objetivo",
+                "suggested_order_qty": "cantidad_sugerida",
+            }
+        )
+        st.dataframe(suggested_view, use_container_width=True, height=360)
+        st.download_button(
+            "Descargar detalle compra sugerida",
+            data=dataframe_to_excel_bytes(suggested_view),
+            file_name=f"detalle_compra_sugerida_{analysis_month}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     st.subheader("Resumen por marca")
     summary_brand = (
