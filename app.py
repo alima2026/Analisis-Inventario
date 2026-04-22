@@ -30,6 +30,7 @@ ORDER_DRAFT_STATUS = "BORRADOR"
 ORDER_CONFIRMED_STATUS = "ABIERTO"
 LOCKED_ORDER_STATUSES = {"ABIERTO", "PARCIAL", "RECIBIDO_INFERIDO", "VACIO"}
 ORDER_EDITOR_COLUMNS = ["PART NO", "PCS", "DESCRIPCION", "MARCA"]
+ABC_SORT_ORDER = {"A": 1, "B": 2, "C": 3, "Muerto": 4, "Sin historial": 5}
 
 
 # =========================================================
@@ -974,10 +975,19 @@ def add_inventory_logic(df: pd.DataFrame, target_months: int, lead_time_months: 
 
 
 def add_abc(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["abc"] = "Sin historial"
+
+    stock_dead_mask = (out["stock"] > 0) & (out["sales_units"] <= 0)
+    active_mask = out["sales_units"] > 0
+
     metric_col = "sales_uyu" if df["sales_uyu"].sum() > 0 else "sales_units"
-    abc_df = classify_abc(df[["part_no", metric_col]].copy(), value_col=metric_col)
-    out = df.merge(abc_df[["part_no", "abc"]], on="part_no", how="left")
-    out["abc"] = out["abc"].fillna("C")
+    if active_mask.any():
+        abc_df = classify_abc(out.loc[active_mask, ["part_no", metric_col]].copy(), value_col=metric_col)
+        abc_map = abc_df.set_index("part_no")["abc"].to_dict()
+        out.loc[active_mask, "abc"] = out.loc[active_mask, "part_no"].map(abc_map).fillna("C")
+
+    out.loc[stock_dead_mask, "abc"] = "Muerto"
     return out
 
 
@@ -2826,7 +2836,11 @@ def main():
 
     brand_options = ["Todos"] + sorted(final_df["brand"].dropna().unique().tolist())
     status_options = ["Todos"] + sorted(final_df["status"].dropna().unique().tolist())
-    abc_options = ["Todos", "A", "B", "C"]
+    abc_values = sorted(
+        final_df["abc"].dropna().unique().tolist(),
+        key=lambda value: ABC_SORT_ORDER.get(value, 99),
+    )
+    abc_options = ["Todos"] + abc_values
 
     filter_col_1, filter_col_2, filter_col_3, filter_col_4 = st.columns(4)
     selected_brand = filter_col_1.selectbox("Marca", brand_options)
@@ -2929,7 +2943,7 @@ def main():
     )
     st.dataframe(summary_brand, use_container_width=True)
 
-    st.subheader("Resumen ABC")
+    st.subheader("Resumen ABC / Muerto")
     summary_abc = (
         view.groupby("abc", as_index=False)
         .agg(
@@ -2940,8 +2954,9 @@ def main():
             abierto_db=("open_order_qty_db", "sum"),
             sugerido=("suggested_order_qty", "sum"),
         )
-        .sort_values("abc")
     )
+    summary_abc["orden"] = summary_abc["abc"].map(ABC_SORT_ORDER).fillna(99)
+    summary_abc = summary_abc.sort_values("orden").drop(columns=["orden"])
     st.dataframe(summary_abc, use_container_width=True)
 
     st.subheader("Top productos por ventas")
