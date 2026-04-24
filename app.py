@@ -31,11 +31,13 @@ DEPOSIT_LABELS = {
 MUDANZA_DESTINATIONS = ["Pendiente", "Polo Logistico", "Darkinel"]
 EDITABLE_ORDER_SOURCE_TYPE = "pedido_editable_mazda"
 FINAL_MAZDA_ORDER_SOURCE_TYPE = "pedido_final_mazda"
+IMPORTED_ORDER_SOURCE_TYPE = "archivo_pedido_importado"
 ORDER_DRAFT_STATUS = "BORRADOR"
 ORDER_CONFIRMED_STATUS = "ABIERTO"
 LOCKED_ORDER_STATUSES = {"ABIERTO", "PARCIAL", "RECIBIDO_INFERIDO", "VACIO"}
 ORDER_EDITOR_COLUMNS = ["PART NO", "PCS", "DESCRIPCION", "MARCA"]
-ABC_SORT_ORDER = {"A": 1, "B": 2, "C": 3, "Muerto": 4, "Sin historial": 5}
+NO_ROTATION_LABEL = "Sin rotacion +3 anios"
+ABC_SORT_ORDER = {"A": 1, "B": 2, "C": 3, NO_ROTATION_LABEL: 4, "Muerto": 4, "Sin historial": 5}
 
 
 # =========================================================
@@ -400,6 +402,21 @@ def safe_text(value) -> str:
     return str(value).strip()
 
 
+def normalize_inventory_quality(value) -> str:
+    text = safe_text(value)
+    if not text:
+        return "Sin historial"
+
+    normalized = text.upper()
+    if normalized in {"A", "B", "C"}:
+        return normalized
+    if "MUERTO" in normalized or "SIN ROTACION" in normalized:
+        return NO_ROTATION_LABEL
+    if "SIN HISTORIAL" in normalized:
+        return "Sin historial"
+    return text
+
+
 def clone_excel_source(source_file):
     if hasattr(source_file, "getvalue"):
         return BytesIO(source_file.getvalue())
@@ -434,14 +451,14 @@ def normalize_order_number(value) -> str:
 
 def classify_order_number(order_number: str) -> dict:
     code = normalize_order_number(order_number)
-    if re.fullmatch(r"HC1[A-Z0-9]", code):
+    if re.fullmatch(r"HC[0-9][A-Z0-9]{1,2}", code):
         return {
             "order_code": code,
             "transport_type": "AEREO",
             "lead_time_days": 30,
             "label": "Aereo - demora estimada 30 dias",
         }
-    if re.fullmatch(r"HC[A-Z][A-Z0-9]", code):
+    if re.fullmatch(r"HC[A-Z][A-Z0-9]{1,2}", code):
         return {
             "order_code": code,
             "transport_type": "MARITIMO",
@@ -454,6 +471,44 @@ def classify_order_number(order_number: str) -> dict:
         "lead_time_days": 0,
         "label": "Numero no reconocido: usa formato HCCA/HCJV para maritimo o HC1A/HC1D para aereo",
     }
+
+
+def classify_transport_from_arrange(arrange: str, order_code: str = "") -> dict:
+    arrange_text = safe_text(arrange).upper()
+    if arrange_text in {"AIR", "AEREO", "AÉREO"}:
+        return {
+            "order_code": normalize_order_number(order_code),
+            "transport_type": "AEREO",
+            "lead_time_days": 30,
+            "label": "Aereo - demora estimada 30 dias",
+        }
+    if arrange_text in {"SEA", "MARITIMO", "MARÍTIMO"}:
+        return {
+            "order_code": normalize_order_number(order_code),
+            "transport_type": "MARITIMO",
+            "lead_time_days": 180,
+            "label": "Maritimo - demora estimada 6 meses",
+        }
+    return classify_order_number(order_code)
+
+
+def parse_order_reference_timestamp(value, fallback_analysis_month: str = "") -> str:
+    text = safe_text(value)
+    parsed = pd.NaT
+
+    if text:
+        digits = re.sub(r"\D", "", text)
+        if len(digits) == 8:
+            parsed = pd.to_datetime(digits, format="%Y%m%d", errors="coerce")
+        if pd.isna(parsed):
+            parsed = pd.to_datetime(text, errors="coerce")
+
+    if pd.isna(parsed) and fallback_analysis_month:
+        parsed = pd.to_datetime(f"{fallback_analysis_month}-01", errors="coerce")
+
+    if pd.isna(parsed):
+        return ""
+    return parsed.normalize().strftime("%Y-%m-%dT00:00:00")
 
 
 def estimate_order_eta(created_at: str, lead_time_days: int) -> str:
@@ -1152,37 +1207,166 @@ def load_backorder(uploaded_file) -> pd.DataFrame:
     return out
 
 
-def load_monthly_order(uploaded_file) -> pd.DataFrame:
+def load_monthly_order(uploaded_file, default_analysis_month: str = "") -> pd.DataFrame:
+    fallback_month = safe_text(default_analysis_month) or date.today().strftime("%Y-%m")
     df = pd.read_excel(uploaded_file)
     df = df.copy()
 
-    part_col = "PART NO" if "PART NO" in df.columns else df.columns[0]
-    qty_col = "PCS" if "PCS" in df.columns else df.columns[1]
-    order_no_col = "ORDER NO" if "ORDER NO" in df.columns else None
+    def finalize_order_lines(source_df: pd.DataFrame) -> pd.DataFrame:
+        columns = [
+            "order_code",
+            "order_name",
+            "analysis_month",
+            "created_at",
+            "transport_type",
+            "lead_time_days",
+            "eta_date",
+            "part_key",
+            "part_no",
+            "description",
+            "brand",
+            "quantity",
+            "picked_qty",
+            "received_qty",
+            "open_qty",
+            "item_status",
+        ]
+        if source_df.empty:
+            return pd.DataFrame(columns=columns)
 
-    df = add_part_identity(df, part_col, allow_mazda_compact=True)
-    df["monthly_order_qty"] = safe_numeric(df[qty_col])
-    df = df[df["part_key"] != ""].copy()
-    report = build_code_unification_report(df, "Pedido a fabrica", "monthly_order_qty", allow_mazda_compact=True)
-    formatted_count = int(df["_part_formatted"].sum())
+        out = source_df.copy()
+        out["description"] = out["description"].fillna("").astype(str).str.strip()
+        out["brand"] = out["brand"].fillna("").astype(str).str.strip()
+        out["quantity"] = pd.to_numeric(out["quantity"], errors="coerce").fillna(0.0)
+        out["picked_qty"] = pd.to_numeric(out.get("picked_qty", 0), errors="coerce").fillna(0.0)
+        out["received_qty"] = out[["picked_qty", "quantity"]].min(axis=1)
+        out["open_qty"] = (out["quantity"] - out["received_qty"]).clip(lower=0)
+        out["item_status"] = "ABIERTO"
+        out.loc[(out["received_qty"] > 0) & (out["open_qty"] > 0), "item_status"] = "PARCIAL"
+        out.loc[(out["received_qty"] > 0) & (out["open_qty"] <= 0), "item_status"] = "RECIBIDO_INFERIDO"
+        return out[columns]
+
+    def build_simple_order_lines(order_df: pd.DataFrame) -> pd.DataFrame:
+        part_col = "PART NO" if "PART NO" in order_df.columns else order_df.columns[0]
+        qty_col = "PCS" if "PCS" in order_df.columns else order_df.columns[1]
+        order_no_col = "ORDER NO" if "ORDER NO" in order_df.columns else None
+        desc_col = "DESCRIPCION" if "DESCRIPCION" in order_df.columns else ("DESCRIPTION" if "DESCRIPTION" in order_df.columns else None)
+        brand_col = "MARCA" if "MARCA" in order_df.columns else ("BRAND" if "BRAND" in order_df.columns else None)
+
+        out = add_part_identity(order_df, part_col, allow_mazda_compact=True)
+        out["description"] = order_df[desc_col].fillna("").astype(str).str.strip() if desc_col else ""
+        out["brand"] = order_df[brand_col].fillna("").astype(str).str.strip() if brand_col else ""
+        out["quantity"] = safe_numeric(order_df[qty_col])
+        order_value = ""
+        if order_no_col and order_no_col in order_df.columns:
+            values = [normalize_order_number(value) for value in order_df[order_no_col].dropna().tolist() if safe_text(value)]
+            if values:
+                order_value = values[0]
+        order_value = order_value or normalize_order_number(Path(uploaded_file.name).stem)
+        transport_meta = classify_order_number(order_value)
+        created_at = parse_order_reference_timestamp("", "")
+        out["order_code"] = transport_meta["order_code"] or order_value
+        out["order_name"] = out["order_code"].replace("", Path(uploaded_file.name).stem)
+        out["analysis_month"] = fallback_month
+        out["created_at"] = created_at or f"{out['analysis_month'].iloc[0]}-01T00:00:00"
+        out["transport_type"] = transport_meta["transport_type"]
+        out["lead_time_days"] = int(transport_meta["lead_time_days"])
+        out["eta_date"] = estimate_order_eta(out["created_at"].iloc[0], int(transport_meta["lead_time_days"]))
+        out["brand"] = out.apply(
+            lambda row: row["brand"] if safe_text(row["brand"]) else detect_brand(row["part_no"], row["description"]),
+            axis=1,
+        )
+        out = out[(out["part_key"] != "") & (out["quantity"] > 0)].copy()
+        report = build_code_unification_report(out, "Pedido a fabrica", "quantity", allow_mazda_compact=True)
+        formatted_count = int(out["_part_formatted"].sum()) if "_part_formatted" in out.columns else 0
+        finalized = finalize_order_lines(out)
+        finalized.attrs["code_unifications"] = report
+        finalized.attrs["formatted_code_count"] = formatted_count
+        return finalized
+
+    def build_multi_order_report_lines(order_df: pd.DataFrame) -> pd.DataFrame:
+        out = add_part_identity(order_df, "Current", allow_mazda_compact=True)
+        out["order_code"] = order_df["Number"].map(normalize_order_number)
+        out["order_name"] = out["order_code"]
+        out["description"] = order_df["Part"].fillna("").astype(str).str.strip()
+        out["quantity"] = safe_numeric(order_df["Number.2"])
+        out["picked_qty"] = safe_numeric(order_df["Pick"]) if "Pick" in order_df.columns else 0.0
+        out["arrange"] = order_df["Arrange"].fillna("").astype(str).str.strip().str.upper() if "Arrange" in order_df.columns else ""
+        out["created_at"] = order_df["Pack"].apply(lambda value: parse_order_reference_timestamp(value, "")) if "Pack" in order_df.columns else ""
+        out["analysis_month"] = out["created_at"].astype(str).str[:7]
+        out.loc[out["analysis_month"].eq(""), "analysis_month"] = fallback_month
+        out = out[(out["part_key"] != "") & (out["order_code"] != "") & (out["quantity"] > 0)].copy()
+        if out.empty:
+            return finalize_order_lines(out)
+
+        report = build_code_unification_report(out, "Pedido a fabrica", "quantity", allow_mazda_compact=True)
+        formatted_count = int(out["_part_formatted"].sum()) if "_part_formatted" in out.columns else 0
+
+        grouped = (
+            out.groupby(["order_code", "part_key"], as_index=False)
+            .agg(
+                order_name=("order_name", first_non_empty),
+                analysis_month=("analysis_month", first_non_empty),
+                created_at=("created_at", first_non_empty),
+                arrange=("arrange", first_non_empty),
+                part_no=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
+                description=("description", first_non_empty),
+                quantity=("quantity", "sum"),
+                picked_qty=("picked_qty", "sum"),
+            )
+        )
+        grouped["created_at"] = grouped.apply(
+            lambda row: row["created_at"] if safe_text(row["created_at"]) else f"{row['analysis_month']}-01T00:00:00",
+            axis=1,
+        )
+        grouped["transport_meta"] = grouped.apply(
+            lambda row: classify_transport_from_arrange(row["arrange"], row["order_code"]),
+            axis=1,
+        )
+        grouped["transport_type"] = grouped["transport_meta"].map(lambda item: item["transport_type"])
+        grouped["lead_time_days"] = grouped["transport_meta"].map(lambda item: int(item["lead_time_days"]))
+        grouped["eta_date"] = grouped.apply(
+            lambda row: estimate_order_eta(row["created_at"], int(row["lead_time_days"])),
+            axis=1,
+        )
+        grouped["brand"] = grouped.apply(lambda row: detect_brand(row["part_no"], row["description"]), axis=1)
+        finalized = finalize_order_lines(grouped)
+        finalized.attrs["code_unifications"] = report
+        finalized.attrs["formatted_code_count"] = formatted_count
+        return finalized
+
+    if {"Current", "Number", "Number.2"}.issubset(df.columns):
+        order_lines = build_multi_order_report_lines(df)
+    else:
+        order_lines = build_simple_order_lines(df)
+
+    if order_lines.empty:
+        return empty_monthly_order(uploaded_file.name)
+
     order_summary = (
-        df.groupby("part_key", as_index=False)
+        order_lines.groupby("part_key", as_index=False)
         .agg(
             part_no=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
-            monthly_order_qty=("monthly_order_qty", "sum"),
+            monthly_order_qty=("quantity", "sum"),
         )
+        .sort_values("part_no")
+        .reset_index(drop=True)
     )
 
-    order_code = ""
-    if order_no_col and order_no_col in df.columns:
-        order_values = [safe_text(value) for value in df[order_no_col].dropna().tolist() if safe_text(value)]
-        if order_values:
-            order_code = order_values[0]
+    unique_orders = [value for value in order_lines["order_code"].dropna().astype(str).str.strip().unique().tolist() if value]
+    if len(unique_orders) == 1:
+        order_code = unique_orders[0]
+    elif len(unique_orders) > 1:
+        order_code = f"ARCHIVO {len(unique_orders)} PEDIDOS"
+    else:
+        order_code = Path(uploaded_file.name).stem
 
-    order_summary.attrs["order_code"] = order_code if order_code else Path(uploaded_file.name).stem
+    order_summary.attrs["order_code"] = order_code
     order_summary.attrs["source_file_name"] = uploaded_file.name
-    order_summary.attrs["code_unifications"] = report
-    order_summary.attrs["formatted_code_count"] = formatted_count
+    order_summary.attrs["code_unifications"] = order_lines.attrs.get("code_unifications", pd.DataFrame())
+    order_summary.attrs["formatted_code_count"] = int(order_lines.attrs.get("formatted_code_count", 0) or 0)
+    order_summary.attrs["order_count"] = max(len(unique_orders), 1)
+    order_summary.attrs["order_lines_for_import"] = order_lines
     return order_summary
 
 
@@ -1364,6 +1548,7 @@ def add_inventory_logic(df: pd.DataFrame, target_months: int, lead_time_months: 
 def add_abc(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["abc"] = "Sin historial"
+    out["inventory_quality"] = "Sin historial"
 
     stock_dead_mask = (out["stock"] > 0) & (out["sales_units"] <= 0)
     active_mask = out["sales_units"] > 0
@@ -1373,8 +1558,12 @@ def add_abc(df: pd.DataFrame) -> pd.DataFrame:
         abc_df = classify_abc(out.loc[active_mask, ["part_no", metric_col]].copy(), value_col=metric_col)
         abc_map = abc_df.set_index("part_no")["abc"].to_dict()
         out.loc[active_mask, "abc"] = out.loc[active_mask, "part_no"].map(abc_map).fillna("C")
+        out.loc[active_mask, "inventory_quality"] = out.loc[active_mask, "abc"].map(normalize_inventory_quality)
 
     out.loc[stock_dead_mask, "abc"] = "Muerto"
+    out.loc[stock_dead_mask, "inventory_quality"] = NO_ROTATION_LABEL
+    out["inventory_quality"] = out["inventory_quality"].map(normalize_inventory_quality)
+    out["no_rotation_3y"] = stock_dead_mask.astype(int)
     return out
 
 
@@ -1673,8 +1862,33 @@ def init_db():
         ensure_column(conn, "factory_order_items", "received_qty", "REAL DEFAULT 0")
         ensure_column(conn, "factory_order_items", "open_qty", "REAL DEFAULT 0")
         ensure_column(conn, "factory_order_items", "last_reconciled_at", "TEXT")
+        ensure_column(conn, "analysis_run_items", "part_key", "TEXT")
+        ensure_column(conn, "analysis_run_items", "inventory_quality", "TEXT")
+        ensure_column(conn, "analysis_run_items", "no_rotation_3y", "INTEGER DEFAULT 0")
         conn.execute("UPDATE factory_order_items SET received_qty = COALESCE(received_qty, 0)")
         conn.execute("UPDATE factory_order_items SET open_qty = COALESCE(open_qty, quantity)")
+        conn.execute(
+            """
+            UPDATE analysis_run_items
+            SET inventory_quality = CASE
+                WHEN COALESCE(TRIM(inventory_quality), '') <> '' THEN inventory_quality
+                WHEN COALESCE(stock, 0) > 0 AND COALESCE(sales_units, 0) <= 0 THEN ?
+                WHEN UPPER(COALESCE(TRIM(abc), '')) IN ('A', 'B', 'C') THEN UPPER(TRIM(abc))
+                ELSE 'Sin historial'
+            END
+            """,
+            (NO_ROTATION_LABEL,),
+        )
+        conn.execute(
+            """
+            UPDATE analysis_run_items
+            SET no_rotation_3y = CASE
+                WHEN COALESCE(stock, 0) > 0 AND COALESCE(sales_units, 0) <= 0 THEN 1
+                ELSE 0
+            END
+            WHERE no_rotation_3y IS NULL OR no_rotation_3y NOT IN (0, 1)
+            """
+        )
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_analysis_runs_company_date ON analysis_runs(empresa, analysis_date, created_at)"
@@ -1763,8 +1977,9 @@ def insert_analysis_run_record(
 
 
 def persist_analysis_items(conn, run_id: int, final_df: pd.DataFrame):
-    storage_df = final_df.copy()
+    storage_df = ensure_part_identity_columns(final_df.copy(), allow_mazda_compact=True)
     required_columns = [
+        "part_key",
         "part_no",
         "description",
         "brand",
@@ -1785,8 +2000,10 @@ def persist_analysis_items(conn, run_id: int, final_df: pd.DataFrame):
         "lead_time_need_qty",
         "suggested_order_qty",
         "abc",
+        "inventory_quality",
         "status",
         "stock_muerto",
+        "no_rotation_3y",
         "oferta_sugerida",
         "estimated_unit_cost",
         "intelligent_buy_qty",
@@ -1797,13 +2014,14 @@ def persist_analysis_items(conn, run_id: int, final_df: pd.DataFrame):
 
     for col in required_columns:
         if col not in storage_df.columns:
-            storage_df[col] = 0 if col not in {"description", "brand", "abc", "status"} else ""
+            storage_df[col] = 0 if col not in {"part_key", "description", "brand", "abc", "inventory_quality", "status"} else ""
 
     rows = []
     for _, row in storage_df[required_columns].iterrows():
         rows.append(
             (
                 run_id,
+                safe_text(row["part_key"]),
                 safe_text(row["part_no"]),
                 safe_text(row["description"]),
                 safe_text(row["brand"]),
@@ -1824,8 +2042,10 @@ def persist_analysis_items(conn, run_id: int, final_df: pd.DataFrame):
                 float(row["lead_time_need_qty"]),
                 float(row["suggested_order_qty"]),
                 safe_text(row["abc"]),
+                normalize_inventory_quality(row["inventory_quality"]),
                 safe_text(row["status"]),
                 int(bool(row["stock_muerto"])),
+                int(bool(row["no_rotation_3y"])),
                 int(bool(row["oferta_sugerida"])),
                 float(row["estimated_unit_cost"]),
                 float(row["intelligent_buy_qty"]),
@@ -1838,14 +2058,14 @@ def persist_analysis_items(conn, run_id: int, final_df: pd.DataFrame):
     conn.executemany(
         """
         INSERT INTO analysis_run_items (
-            run_id, part_no, description, brand, sales_units, sales_uyu, cost_uyu,
+            run_id, part_key, part_no, description, brand, sales_units, sales_uyu, cost_uyu,
             avg_monthly_units, avg_annual_units, avg_monthly_sales_uyu,
             stock, backorder_qty, monthly_order_qty, pipeline_qty, available_plus_pipeline,
             unit_margin_uyu, months_of_stock, target_stock_qty, lead_time_need_qty,
-            suggested_order_qty, abc, status, stock_muerto, oferta_sugerida,
+            suggested_order_qty, abc, inventory_quality, status, stock_muerto, no_rotation_3y, oferta_sugerida,
             estimated_unit_cost, intelligent_buy_qty, intelligent_buy_cost,
             estimated_gross_profit, smart_score
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -2105,6 +2325,132 @@ def save_final_mazda_order(
         replace_order_items(conn, batch_id, normalized, ORDER_CONFIRMED_STATUS)
         conn.commit()
         return batch_id, False
+
+
+def import_order_file_to_database(
+    empresa: str,
+    analysis_month: str,
+    uploaded_file,
+    notes: str = "",
+) -> dict:
+    order_summary = load_monthly_order(uploaded_file, default_analysis_month=analysis_month)
+    order_lines = order_summary.attrs.get("order_lines_for_import")
+    if not isinstance(order_lines, pd.DataFrame) or order_lines.empty:
+        raise ValueError("El archivo de pedido no tiene lineas validas para registrar en la base.")
+
+    file_hash = build_file_hash(uploaded_file)
+    saved_batches = 0
+    duplicate_batches = 0
+    saved_items = 0
+    saved_qty = 0.0
+    batch_ids = []
+
+    grouped_orders = order_lines.groupby("order_code", dropna=False)
+    with get_connection() as conn:
+        for idx, (order_code_value, group) in enumerate(grouped_orders, start=1):
+            batch_code = normalize_order_number(order_code_value) or f"{Path(uploaded_file.name).stem}-{idx:02d}"
+            batch_name = batch_code or f"Pedido importado {analysis_month}-{idx:02d}"
+            meta = group.iloc[0]
+            batch_month = safe_text(meta.get("analysis_month", "")) or analysis_month
+            created_at = safe_text(meta.get("created_at", "")) or f"{batch_month}-01T00:00:00"
+            transport_type = safe_text(meta.get("transport_type", ""))
+            lead_time_days = int(pd.to_numeric(meta.get("lead_time_days", 0), errors="coerce") or 0)
+            eta_date = safe_text(meta.get("eta_date", "")) or estimate_order_eta(created_at, lead_time_days)
+            source_hash = f"imported:{empresa}:{file_hash}:{batch_code}"
+
+            existing = conn.execute(
+                """
+                SELECT id
+                FROM factory_order_batches
+                WHERE source_hash = ?
+                   OR (
+                        empresa = ?
+                        AND COALESCE(NULLIF(order_code, ''), order_name) = ?
+                        AND status <> 'CANCELADO'
+                      )
+                LIMIT 1
+                """,
+                (source_hash, empresa, batch_name),
+            ).fetchone()
+            if existing is not None:
+                duplicate_batches += 1
+                batch_ids.append(int(existing["id"]))
+                continue
+
+            cursor = conn.execute(
+                """
+                INSERT INTO factory_order_batches (
+                    run_id, empresa, analysis_month, created_at, source_type, order_name, order_code,
+                    order_file_hash, file_name, transport_type, lead_time_days, eta_date,
+                    total_items, total_qty, status, source_hash, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    None,
+                    empresa,
+                    batch_month,
+                    created_at,
+                    IMPORTED_ORDER_SOURCE_TYPE,
+                    batch_name,
+                    batch_code,
+                    file_hash,
+                    uploaded_file.name,
+                    transport_type,
+                    lead_time_days,
+                    eta_date,
+                    int(len(group)),
+                    float(pd.to_numeric(group["quantity"], errors="coerce").fillna(0).sum()),
+                    ORDER_CONFIRMED_STATUS,
+                    source_hash,
+                    notes,
+                ),
+            )
+            batch_id = int(cursor.lastrowid)
+            item_rows = []
+            for _, row in group.iterrows():
+                qty = float(pd.to_numeric(row["quantity"], errors="coerce") or 0)
+                received_qty = float(pd.to_numeric(row.get("received_qty", 0), errors="coerce") or 0)
+                open_qty = float(pd.to_numeric(row.get("open_qty", qty - received_qty), errors="coerce") or 0)
+                item_rows.append(
+                    (
+                        batch_id,
+                        safe_text(row["part_no"]),
+                        safe_text(row["description"]),
+                        safe_text(row["brand"]),
+                        qty,
+                        received_qty,
+                        max(open_qty, 0.0),
+                        safe_text(row.get("created_at", "")) or None,
+                        safe_text(row.get("item_status", "")) or ORDER_CONFIRMED_STATUS,
+                    )
+                )
+
+            conn.executemany(
+                """
+                INSERT INTO factory_order_items (
+                    batch_id, part_no, description, brand, quantity, received_qty, open_qty, last_reconciled_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                item_rows,
+            )
+            refresh_batch_status(conn, batch_id)
+            saved_batches += 1
+            saved_items += int(len(group))
+            saved_qty += float(pd.to_numeric(group["quantity"], errors="coerce").fillna(0).sum())
+            batch_ids.append(batch_id)
+
+        conn.commit()
+
+    return {
+        "status": "saved" if saved_batches > 0 else "duplicate",
+        "saved_batches": saved_batches,
+        "duplicate_batches": duplicate_batches,
+        "saved_items": saved_items,
+        "saved_qty": saved_qty,
+        "batch_ids": batch_ids,
+        "file_name": uploaded_file.name,
+        "message": "Base de pedidos generada correctamente." if saved_batches > 0 else "Esos pedidos ya estaban registrados.",
+    }
 
 
 def load_editable_order_batches(empresa: str, limit: int = 50) -> pd.DataFrame:
@@ -2414,18 +2760,34 @@ def save_analysis_run(
             notes=notes,
         )
 
+        batch_id = None
         if duplicated:
+            if register_current_order and pedido_file is not None and not order_df.empty:
+                batch_id, _ = create_order_batch(
+                    conn=conn,
+                    run_id=run_id,
+                    empresa=empresa,
+                    analysis_month=analysis_month,
+                    created_at=created_at,
+                    order_file_hash=order_file_hash,
+                    source_type="archivo_pedido_mensual",
+                    order_name=safe_text(order_df.attrs.get("order_code", "")) or f"Pedido fabrica {analysis_month} - corrida {run_id}",
+                    order_df=order_df,
+                    final_df=final_df,
+                    file_name=pedido_file.name,
+                    notes=notes,
+                )
+                conn.commit()
             return {
                 "status": "duplicate",
                 "run_id": run_id,
-                "batch_id": None,
+                "batch_id": batch_id,
                 "message": "Esta corrida ya estaba guardada en la base.",
             }
 
         persist_analysis_items(conn, run_id, final_df)
         reconcile_open_orders_with_inventory(conn, empresa, final_df, created_at)
 
-        batch_id = None
         if register_current_order and pedido_file is not None and not order_df.empty:
             order_code = safe_text(order_df.attrs.get("order_code", ""))
             order_name = order_code if order_code else f"Pedido fabrica {analysis_month} - corrida {run_id}"
@@ -2710,35 +3072,125 @@ def load_latest_mudanza_decisions(empresa: str) -> pd.DataFrame:
     return df
 
 
-def load_recent_order_batches(empresa: str, limit: int = 12) -> pd.DataFrame:
+def load_order_run_fallbacks(run_ids: list[int]) -> dict[int, dict[str, float]]:
+    valid_run_ids = sorted({int(run_id) for run_id in run_ids if pd.notna(run_id)})
+    if not valid_run_ids:
+        return {}
+
+    placeholders = ",".join(["?"] * len(valid_run_ids))
+    query = f"""
+        SELECT
+            r.id AS run_id,
+            COALESCE(r.order_rows, 0) AS order_rows,
+            COUNT(CASE WHEN COALESCE(monthly_order_qty, 0) > 0 THEN 1 END) AS total_items,
+            ROUND(COALESCE(SUM(monthly_order_qty), 0), 2) AS total_qty
+        FROM analysis_runs r
+        LEFT JOIN analysis_run_items i ON i.run_id = r.id
+        WHERE r.id IN ({placeholders})
+        GROUP BY r.id, r.order_rows
+    """
+    with get_connection() as conn:
+        rows = conn.execute(query, valid_run_ids).fetchall()
+
+    return {
+        int(row["run_id"]): {
+            "total_items": int(row["total_items"] or row["order_rows"] or 0),
+            "total_qty": float(row["total_qty"] or 0),
+        }
+        for row in rows
+    }
+
+
+def load_recent_order_batches(empresa: str, limit: int = 12, analysis_month: Optional[str] = None) -> pd.DataFrame:
+    params = [empresa]
+    month_filter = ""
+    if analysis_month:
+        month_filter = " AND b.analysis_month = ?"
+        params.append(analysis_month)
+    params.append(limit)
+
     with get_connection() as conn:
         df = pd.read_sql_query(
-            """
+            f"""
             SELECT
                 b.id AS lote_id,
+                b.run_id AS run_id,
                 b.analysis_month AS mes_analisis,
                 b.created_at AS fecha_carga,
                 b.source_type AS origen,
-                COALESCE(b.order_code, b.order_name) AS nombre_lote,
+                COALESCE(NULLIF(b.order_code, ''), b.order_name) AS nombre_lote,
                 b.file_name AS archivo,
                 COALESCE(b.transport_type, '') AS tipo_envio,
                 COALESCE(b.lead_time_days, 0) AS demora_dias,
                 COALESCE(b.eta_date, '') AS llegada_estimada,
-                b.total_items,
-                b.total_qty,
+                COALESCE(NULLIF(b.total_items, 0), COUNT(i.id)) AS total_items,
+                ROUND(
+                    CASE
+                        WHEN COALESCE(SUM(i.quantity), 0) > 0 THEN SUM(i.quantity)
+                        ELSE COALESCE(b.total_qty, 0)
+                    END,
+                    2
+                ) AS total_qty,
                 ROUND(COALESCE(SUM(i.open_qty), 0), 2) AS qty_abierta,
                 b.status
             FROM factory_order_batches b
             LEFT JOIN factory_order_items i ON i.batch_id = b.id
             WHERE b.empresa = ?
+              {month_filter}
             GROUP BY b.id, b.analysis_month, b.created_at, b.source_type, b.order_code, b.order_name, b.file_name, b.transport_type, b.lead_time_days, b.eta_date, b.total_items, b.total_qty, b.status
             ORDER BY created_at DESC
             LIMIT ?
             """,
             conn,
-            params=(empresa, limit),
+            params=params,
         )
+    if df.empty:
+        return df
+
+    fallback_map = load_order_run_fallbacks(df["run_id"].dropna().tolist())
+    df["fallback_items"] = df["run_id"].map(lambda run_id: fallback_map.get(int(run_id), {}).get("total_items", 0) if pd.notna(run_id) else 0)
+    df["fallback_qty"] = df["run_id"].map(lambda run_id: fallback_map.get(int(run_id), {}).get("total_qty", 0.0) if pd.notna(run_id) else 0.0)
+
+    df["total_items"] = pd.to_numeric(df["total_items"], errors="coerce").fillna(0)
+    df["total_qty"] = pd.to_numeric(df["total_qty"], errors="coerce").fillna(0.0)
+    df["qty_abierta"] = pd.to_numeric(df["qty_abierta"], errors="coerce").fillna(0.0)
+
+    missing_items = df["total_items"] <= 0
+    missing_qty = df["total_qty"] <= 0
+    missing_open = (df["qty_abierta"] <= 0) & df["status"].isin(["ABIERTO", "PARCIAL"])
+
+    df.loc[missing_items, "total_items"] = df.loc[missing_items, "fallback_items"]
+    df.loc[missing_qty, "total_qty"] = df.loc[missing_qty, "fallback_qty"]
+    df.loc[missing_open, "qty_abierta"] = df.loc[missing_open, "fallback_qty"]
+
+    df["total_items"] = df["total_items"].astype(int)
+    df["total_qty"] = df["total_qty"].astype(float)
+    df["qty_abierta"] = df["qty_abierta"].astype(float)
+    df = df.drop(columns=["fallback_items", "fallback_qty"])
     return df
+
+
+def load_month_order_summary(empresa: str, analysis_month: str) -> dict:
+    batches_df = load_recent_order_batches(empresa, limit=500, analysis_month=analysis_month)
+    if batches_df.empty:
+        return {
+            "pedidos": 0,
+            "lineas": 0,
+            "qty_total": 0.0,
+            "qty_abierta": 0.0,
+            "ultimo_pedido": "",
+            "ultima_fecha": "",
+        }
+
+    latest = batches_df.iloc[0]
+    return {
+        "pedidos": int(len(batches_df)),
+        "lineas": int(pd.to_numeric(batches_df["total_items"], errors="coerce").fillna(0).sum()),
+        "qty_total": float(pd.to_numeric(batches_df["total_qty"], errors="coerce").fillna(0).sum()),
+        "qty_abierta": float(pd.to_numeric(batches_df["qty_abierta"], errors="coerce").fillna(0).sum()),
+        "ultimo_pedido": safe_text(latest["nombre_lote"]),
+        "ultima_fecha": safe_text(latest["fecha_carga"]),
+    }
 
 
 def load_previous_run(empresa: str, current_source_hash: str, current_analysis_date: date):
@@ -2794,8 +3246,66 @@ def load_run_items(run_id: int) -> pd.DataFrame:
             backorder_qty=("backorder_qty", "sum"),
             monthly_order_qty=("monthly_order_qty", "sum"),
         )
-    )
+        )
     return df
+
+
+def load_inventory_snapshot_items(run_id: int) -> pd.DataFrame:
+    columns = [
+        "part_no",
+        "description",
+        "brand",
+        "stock",
+        "sales_units",
+        "avg_monthly_units",
+        "months_of_stock",
+        "backorder_qty",
+        "monthly_order_qty",
+        "available_plus_pipeline",
+        "inventory_quality",
+        "status",
+    ]
+    with get_connection() as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                COALESCE(part_no, '') AS part_no,
+                COALESCE(description, '') AS description,
+                COALESCE(brand, '') AS brand,
+                ROUND(COALESCE(stock, 0), 2) AS stock,
+                ROUND(COALESCE(sales_units, 0), 2) AS sales_units,
+                ROUND(COALESCE(avg_monthly_units, 0), 2) AS avg_monthly_units,
+                ROUND(COALESCE(months_of_stock, 0), 2) AS months_of_stock,
+                ROUND(COALESCE(backorder_qty, 0), 2) AS backorder_qty,
+                ROUND(COALESCE(monthly_order_qty, 0), 2) AS monthly_order_qty,
+                ROUND(COALESCE(available_plus_pipeline, 0), 2) AS available_plus_pipeline,
+                COALESCE(
+                    NULLIF(inventory_quality, ''),
+                    CASE
+                        WHEN COALESCE(stock, 0) > 0 AND COALESCE(sales_units, 0) <= 0 THEN ?
+                        WHEN UPPER(COALESCE(TRIM(abc), '')) IN ('A', 'B', 'C') THEN UPPER(TRIM(abc))
+                        ELSE 'Sin historial'
+                    END
+                ) AS inventory_quality,
+                COALESCE(status, '') AS status
+            FROM analysis_run_items
+            WHERE run_id = ?
+              AND COALESCE(stock, 0) > 0
+            """,
+            conn,
+            params=(NO_ROTATION_LABEL, int(run_id)),
+        )
+
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+
+    df["inventory_quality"] = df["inventory_quality"].map(normalize_inventory_quality)
+    df["quality_order"] = df["inventory_quality"].map(lambda value: ABC_SORT_ORDER.get(value, 99))
+    df = df.sort_values(
+        ["quality_order", "stock", "sales_units", "part_no"],
+        ascending=[True, False, False, True],
+    ).drop(columns=["quality_order"])
+    return df[columns]
 
 
 def load_open_factory_orders_by_part(empresa: str, exclude_order_file_hash: Optional[str] = None) -> pd.DataFrame:
@@ -3140,9 +3650,32 @@ def render_save_feedback():
             text += f" Pedido a fabrica #{feedback['batch_id']} registrado."
         st.success(text)
     elif feedback["status"] == "duplicate":
-        st.warning(f"La corrida ya existia en la base con el id #{feedback['run_id']}.")
+        text = f"La corrida ya existia en la base con el id #{feedback['run_id']}."
+        if feedback.get("batch_id"):
+            text += f" El pedido del archivo ya quedo registrado como lote #{feedback['batch_id']}."
+        st.warning(text)
     else:
         st.error(feedback.get("message", "No se pudo guardar la corrida."))
+
+
+def render_order_import_feedback():
+    feedback = st.session_state.pop("order_import_feedback", None)
+    if not feedback:
+        return
+
+    if feedback["status"] == "saved":
+        text = (
+            f"Base de pedidos generada desde {feedback['file_name']}: "
+            f"{feedback['saved_batches']} pedido(s), {feedback['saved_items']} linea(s) y "
+            f"{_format_qty(feedback['saved_qty'])} pcs guardadas."
+        )
+        if feedback.get("duplicate_batches"):
+            text += f" {feedback['duplicate_batches']} pedido(s) ya existian y no se duplicaron."
+        st.success(text)
+    elif feedback["status"] == "duplicate":
+        st.warning(f"Los pedidos de {feedback['file_name']} ya estaban registrados en la base.")
+    else:
+        st.error(feedback.get("message", "No se pudo generar la base de pedidos."))
 
 
 def render_mudanza_feedback():
@@ -3479,7 +4012,186 @@ def render_saved_factory_orders(empresa: str):
         )
 
 
-def render_history_sections(empresa: str):
+def render_order_database_import_section(
+    empresa: str,
+    analysis_month: str,
+    pedido_file,
+    default_note: str = "",
+):
+    st.subheader("Generar base de datos de pedidos")
+    st.caption("Carga el archivo de pedido y el sistema registra en SQLite todo lo pedido, aunque el archivo traiga varios pedidos adentro.")
+    if pedido_file is None:
+        st.info("Carga un archivo en 'Pedido a fabrica' para generar la base de datos de pedidos.")
+        return
+
+    try:
+        order_summary = load_monthly_order(pedido_file, default_analysis_month=analysis_month)
+        order_lines = order_summary.attrs.get("order_lines_for_import")
+    except Exception as exc:
+        st.error(f"No se pudo leer el archivo de pedido: {exc}")
+        return
+
+    if not isinstance(order_lines, pd.DataFrame) or order_lines.empty:
+        st.info("El archivo de pedido no tiene lineas validas para registrar en la base.")
+        return
+
+    batches_preview = (
+        order_lines.groupby("order_code", as_index=False)
+        .agg(
+            analysis_month=("analysis_month", first_non_empty),
+            created_at=("created_at", first_non_empty),
+            transport_type=("transport_type", first_non_empty),
+            items=("part_key", "nunique"),
+            total_qty=("quantity", "sum"),
+            picked_qty=("received_qty", "sum"),
+            open_qty=("open_qty", "sum"),
+        )
+        .sort_values(["analysis_month", "created_at", "order_code"], ascending=[False, False, True])
+    )
+    batches_preview["created_at"] = pd.to_datetime(batches_preview["created_at"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    batches_preview_display = batches_preview.rename(
+        columns={
+            "order_code": "pedido",
+            "analysis_month": "mes",
+            "created_at": "fecha",
+            "transport_type": "tipo_envio",
+            "items": "items",
+            "total_qty": "pcs_pedidas",
+            "picked_qty": "pcs_pick",
+            "open_qty": "pcs_abiertas",
+        }
+    )
+
+    metric_1, metric_2, metric_3, metric_4 = st.columns(4)
+    metric_1.metric("Pedidos detectados", f"{len(batches_preview):,}")
+    metric_2.metric("Lineas detectadas", f"{len(order_lines):,}")
+    metric_3.metric("PCS pedidas", f"{int(pd.to_numeric(order_lines['quantity'], errors='coerce').fillna(0).sum()):,}")
+    metric_4.metric("PCS abiertas estimadas", f"{int(pd.to_numeric(order_lines['open_qty'], errors='coerce').fillna(0).sum()):,}")
+
+    st.dataframe(batches_preview_display, use_container_width=True, height=260, hide_index=True)
+
+    preview_cols = [
+        "order_code",
+        "analysis_month",
+        "part_no",
+        "description",
+        "brand",
+        "quantity",
+        "received_qty",
+        "open_qty",
+    ]
+    st.caption("Vista previa de lineas que se guardaran en la base")
+    st.dataframe(
+        order_lines[preview_cols].rename(
+            columns={
+                "order_code": "pedido",
+                "analysis_month": "mes",
+                "part_no": "codigo",
+                "description": "descripcion",
+                "brand": "marca",
+                "quantity": "pcs_pedidas",
+                "received_qty": "pcs_pick",
+                "open_qty": "pcs_abiertas",
+            }
+        ),
+        use_container_width=True,
+        height=320,
+        hide_index=True,
+    )
+
+    if len(batches_preview) > 1:
+        st.info("Este archivo trae varios pedidos. La base los guarda por separado usando el numero de pedido de cada bloque.")
+
+    if st.button("Generar base de datos de lo pedido", type="primary", key=f"import_orders_db_{analysis_month}_{pedido_file.name}"):
+        try:
+            result = import_order_file_to_database(
+                empresa=empresa,
+                analysis_month=analysis_month,
+                uploaded_file=pedido_file,
+                notes=default_note,
+            )
+            st.session_state["order_import_feedback"] = result
+            st.rerun()
+        except Exception as exc:
+            st.session_state["order_import_feedback"] = {
+                "status": "error",
+                "message": f"No se pudo generar la base de pedidos: {exc}",
+                "file_name": pedido_file.name,
+            }
+            st.rerun()
+
+
+def render_inventory_database_section(empresa: str, analysis_month: str):
+    st.subheader("Base de inventario guardada")
+    history_df = load_recent_runs(empresa, limit=24)
+    if history_df.empty:
+        st.info("Todavia no hay snapshots de inventario guardadas en la base.")
+        return
+
+    labels = [
+        f"#{int(row['corrida_id'])} - {row['mes_analisis']} - {row['fecha_carga']}"
+        for _, row in history_df.iterrows()
+    ]
+    default_index = 0
+    matching_month = history_df.index[history_df["mes_analisis"] == analysis_month].tolist()
+    if matching_month:
+        default_index = int(matching_month[0])
+
+    selected_label = st.selectbox(
+        "Ver inventario guardado",
+        labels,
+        index=default_index,
+        key=f"inventory_snapshot_selector_{empresa}_{analysis_month}",
+    )
+    selected_index = labels.index(selected_label)
+    selected_run = history_df.iloc[selected_index]
+    selected_run_id = int(selected_run["corrida_id"])
+    inventory_df = load_inventory_snapshot_items(selected_run_id)
+
+    created_at = pd.to_datetime(selected_run["fecha_carga"], errors="coerce")
+    created_label = created_at.strftime("%Y-%m-%d %H:%M") if pd.notna(created_at) else safe_text(selected_run["fecha_carga"])
+    st.caption(
+        f"Corrida #{selected_run_id} del mes {selected_run['mes_analisis']} guardada el {created_label}."
+    )
+
+    if inventory_df.empty:
+        st.info("La corrida seleccionada no tiene inventario con stock positivo guardado.")
+        return
+
+    metrics = inventory_df["inventory_quality"].value_counts()
+    metric_1, metric_2, metric_3, metric_4 = st.columns(4)
+    metric_1.metric("A", f"{int(metrics.get('A', 0)):,}")
+    metric_2.metric("B", f"{int(metrics.get('B', 0)):,}")
+    metric_3.metric("C", f"{int(metrics.get('C', 0)):,}")
+    metric_4.metric("Sin rotacion +3 anios", f"{int(metrics.get(NO_ROTATION_LABEL, 0)):,}")
+
+    display_df = inventory_df.rename(
+        columns={
+            "part_no": "codigo",
+            "description": "descripcion",
+            "brand": "marca",
+            "stock": "stock",
+            "sales_units": "ventas_3_anios",
+            "avg_monthly_units": "prom_mensual",
+            "months_of_stock": "meses_stock",
+            "backorder_qty": "backorder",
+            "monthly_order_qty": "pedido_archivo",
+            "available_plus_pipeline": "stock_mas_pipeline",
+            "inventory_quality": "calidad",
+            "status": "estado",
+        }
+    )
+    st.dataframe(display_df, use_container_width=True, height=360, hide_index=True)
+    st.download_button(
+        "Descargar base de inventario",
+        data=dataframe_to_excel_bytes(display_df, sheet_name="Base inventario"),
+        file_name=f"base_inventario_{empresa.lower().replace(' ', '_')}_{selected_run['mes_analisis']}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"download_inventory_snapshot_{selected_run_id}",
+    )
+
+
+def render_history_sections(empresa: str, analysis_month: str):
     render_saved_factory_orders(empresa)
 
     st.subheader("Historial guardado")
@@ -3487,7 +4199,9 @@ def render_history_sections(empresa: str):
     if history_df.empty:
         st.info("Todavia no hay corridas historicas guardadas para esta empresa.")
     else:
-        st.dataframe(history_df, use_container_width=True, height=260)
+        st.dataframe(history_df, use_container_width=True, height=260, hide_index=True)
+
+    render_inventory_database_section(empresa, analysis_month)
 
 
 def render_final_order_upload_manager(
@@ -3598,16 +4312,16 @@ def render_pedido_tab(
 
     brand_options = ["Todos"] + sorted(final_df["brand"].dropna().unique().tolist())
     status_options = ["Todos"] + sorted(final_df["status"].dropna().unique().tolist())
-    abc_values = sorted(
-        final_df["abc"].dropna().unique().tolist(),
+    quality_values = sorted(
+        final_df["inventory_quality"].dropna().map(normalize_inventory_quality).unique().tolist(),
         key=lambda value: ABC_SORT_ORDER.get(value, 99),
     )
-    abc_options = ["Todos"] + abc_values
+    quality_options = ["Todos"] + quality_values
 
     filter_col_1, filter_col_2, filter_col_3, filter_col_4 = st.columns(4)
     selected_brand = filter_col_1.selectbox("Marca", brand_options, key=f"pedido_brand_{analysis_month}")
     selected_status = filter_col_2.selectbox("Estado", status_options, key=f"pedido_status_{analysis_month}")
-    selected_abc = filter_col_3.selectbox("ABC", abc_options, key=f"pedido_abc_{analysis_month}")
+    selected_quality = filter_col_3.selectbox("Calidad inventario", quality_options, key=f"pedido_quality_{analysis_month}")
     search_text = filter_col_4.text_input("Buscar codigo o descripcion", key=f"pedido_search_{analysis_month}")
 
     view = final_df.copy()
@@ -3615,8 +4329,8 @@ def render_pedido_tab(
         view = view[view["brand"] == selected_brand]
     if selected_status != "Todos":
         view = view[view["status"] == selected_status]
-    if selected_abc != "Todos":
-        view = view[view["abc"] == selected_abc]
+    if selected_quality != "Todos":
+        view = view[view["inventory_quality"] == selected_quality]
     if search_text:
         term = search_text.strip().upper()
         term_key = normalize_part_key(term, allow_mazda_compact=True)
@@ -3655,7 +4369,7 @@ def render_pedido_tab(
             "part_no",
             "description",
             "brand",
-            "abc",
+            "inventory_quality",
             "status",
             "sales_units",
             "stock",
@@ -3671,6 +4385,7 @@ def render_pedido_tab(
                 "part_no": "codigo",
                 "description": "descripcion",
                 "brand": "marca",
+                "inventory_quality": "calidad",
                 "status": "estado",
                 "sales_units": "ventas_3_anios",
                 "backorder_qty": "backorder",
@@ -3706,9 +4421,9 @@ def render_pedido_tab(
     )
     st.dataframe(summary_brand, use_container_width=True)
 
-    st.subheader("Resumen ABC / Muerto")
-    summary_abc = (
-        view.groupby("abc", as_index=False)
+    st.subheader("Resumen calidad inventario")
+    summary_quality = (
+        view.groupby("inventory_quality", as_index=False)
         .agg(
             items=("part_no", "count"),
             ventas_base=("sales_units", "sum"),
@@ -3718,9 +4433,9 @@ def render_pedido_tab(
             sugerido=("suggested_order_qty", "sum"),
         )
     )
-    summary_abc["orden"] = summary_abc["abc"].map(ABC_SORT_ORDER).fillna(99)
-    summary_abc = summary_abc.sort_values("orden").drop(columns=["orden"])
-    st.dataframe(summary_abc, use_container_width=True)
+    summary_quality["orden"] = summary_quality["inventory_quality"].map(ABC_SORT_ORDER).fillna(99)
+    summary_quality = summary_quality.sort_values("orden").drop(columns=["orden"])
+    st.dataframe(summary_quality.rename(columns={"inventory_quality": "calidad"}), use_container_width=True, hide_index=True)
 
     st.subheader("Top productos por ventas")
     top_sales = view.sort_values("sales_units", ascending=False).head(top_n)
@@ -3737,7 +4452,7 @@ def render_pedido_tab(
                 "monthly_order_qty",
                 "open_order_qty_db",
                 "months_of_stock",
-                "abc",
+                "inventory_quality",
                 "status",
             ]
         ],
@@ -3771,7 +4486,7 @@ def render_pedido_tab(
                 "part_no",
                 "description",
                 "brand",
-                "abc",
+                "inventory_quality",
                 "status",
                 "stock",
                 "backorder_qty",
@@ -3851,10 +4566,10 @@ def render_pedido_tab(
     else:
         st.dataframe(tracking_view[tracking_cols], use_container_width=True, height=420)
 
-    st.subheader("Stock muerto")
+    st.subheader("Stock sin rotacion +3 anios")
     stock_muerto_df = view[view["stock_muerto"]].copy()
     st.dataframe(
-        stock_muerto_df[["empresa", "part_no", "description", "brand", "stock", "months_of_stock"]],
+        stock_muerto_df[["empresa", "part_no", "description", "brand", "stock", "months_of_stock", "inventory_quality"]],
         use_container_width=True,
         height=280,
     )
@@ -3871,7 +4586,7 @@ def render_pedido_tab(
                 "stock",
                 "months_of_stock",
                 "sales_units",
-                "abc",
+                "inventory_quality",
             ]
         ],
         use_container_width=True,
@@ -3908,6 +4623,7 @@ def render_pedido_tab(
         "target_stock_qty",
         "lead_time_need_qty",
         "suggested_order_qty",
+        "inventory_quality",
         "abc",
         "status",
         "tracking_status",
@@ -3934,7 +4650,7 @@ def render_pedido_tab(
             "stock_muerto": stock_muerto_df[detail_cols],
             "ofertas": ofertas_df[detail_cols],
             "resumen_marca": summary_brand,
-            "resumen_abc": summary_abc,
+            "resumen_calidad": summary_quality.rename(columns={"inventory_quality": "calidad"}),
             "codigos_unificados": code_unification_report,
             "historial_corridas": history_export_df,
             "lotes_pedidos": batches_export_df,
@@ -3960,6 +4676,7 @@ def main():
     st.title("Pedidos Magna")
     st.caption("Analisis de inventario, pedidos y seguimiento historico en SQLite")
     render_save_feedback()
+    render_order_import_feedback()
 
     if "empresa_seleccionada" not in st.session_state:
         st.session_state.empresa_seleccionada = None
@@ -3994,7 +4711,6 @@ def main():
             step=50000.0,
         )
         top_n = st.slider("Top productos", 5, 50, 20)
-        register_current_order = False
         save_note = st.text_input("Nota de corrida", placeholder="Ej: segunda carga del mes")
 
     analysis_date = normalize_analysis_date(analysis_input)
@@ -4036,7 +4752,13 @@ def main():
     backorder_file = resolve_source_file(backorder_upload, detected_sources["backorder"])
     pedido_file = resolve_source_file(pedido_upload, detected_sources["pedido_fabrica"])
 
-    render_history_sections(empresa_activa)
+    render_order_database_import_section(
+        empresa=empresa_activa,
+        analysis_month=analysis_month,
+        pedido_file=pedido_file,
+        default_note=save_note,
+    )
+    render_history_sections(empresa_activa, analysis_month)
 
     if not all([ventas_file, inventario_file, backorder_file]):
         st.info("Para calcular el pedido a solicitar necesitas cargar Ventas 3 anios, Inventario y Backorder. El Pedido a fabrica es opcional.")
@@ -4063,7 +4785,7 @@ def main():
         sales_df = load_sales(ventas_file)
         stock_df = load_inventory(inventario_file)
         backorder_df = load_backorder(backorder_file)
-        order_df = load_monthly_order(pedido_file) if pedido_file is not None else empty_monthly_order()
+        order_df = load_monthly_order(pedido_file, default_analysis_month=analysis_month) if pedido_file is not None else empty_monthly_order()
 
         final_df = build_analysis_dataframe(
             sales_df=sales_df,
@@ -4087,6 +4809,45 @@ def main():
     except Exception as exc:
         st.error(f"Error procesando archivos: {exc}")
         st.stop()
+
+    month_order_summary = load_month_order_summary(empresa_activa, analysis_month)
+    current_order_qty = float(pd.to_numeric(order_df.get("monthly_order_qty", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    current_order_lines = int(
+        (pd.to_numeric(order_df.get("monthly_order_qty", pd.Series(dtype=float)), errors="coerce").fillna(0) > 0).sum()
+    )
+    current_order_batches = int(order_df.attrs.get("order_count", 1) or 1)
+    if month_order_summary["pedidos"] > 0:
+        message = f"En {analysis_month} ya hay {month_order_summary['pedidos']} pedido(s) registrados en base"
+        if month_order_summary["qty_total"] > 0 or month_order_summary["qty_abierta"] > 0:
+            message += (
+                f", {_format_qty(month_order_summary['qty_total'])} pcs totales y "
+                f"{_format_qty(month_order_summary['qty_abierta'])} pcs abiertas."
+            )
+        elif month_order_summary["lineas"] > 0:
+            message += f", con {month_order_summary['lineas']} linea(s) registradas."
+        else:
+            message += "."
+        if month_order_summary["ultimo_pedido"]:
+            message += f" Ultimo pedido: {month_order_summary['ultimo_pedido']}."
+        st.success(message)
+        if current_order_qty > 0:
+            st.caption(
+                f"El archivo de pedido actual trae {current_order_lines} codigo(s) y {_format_qty(current_order_qty)} pcs."
+            )
+    elif current_order_qty > 0:
+        st.info(
+            f"En {analysis_month} aun no hay pedidos guardados en base, pero el archivo actual trae "
+            f"{current_order_lines} codigo(s) y {_format_qty(current_order_qty)} pcs."
+        )
+        st.caption("Al guardar la corrida, ese pedido tambien queda registrado en la base.")
+    else:
+        st.info(f"En {analysis_month} no hay pedidos registrados en base.")
+
+    if pedido_file is not None and current_order_batches > 1:
+        st.info(
+            f"El archivo de pedido actual contiene {current_order_batches} pedidos distintos. "
+            "Para generar la base historica completa usa el bloque 'Generar base de datos de pedidos'."
+        )
 
     if formatted_code_count:
         st.info(
@@ -4121,7 +4882,7 @@ def main():
                 final_df=final_df,
                 source_hash=source_hash,
                 order_file_hash=order_file_hash,
-                register_current_order=register_current_order,
+                register_current_order=pedido_file is not None and not order_df.empty and int(order_df.attrs.get("order_count", 1) or 1) == 1,
                 notes=save_note,
             )
             st.session_state["save_feedback"] = result
