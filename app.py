@@ -38,6 +38,8 @@ ORDER_CONFIRMED_STATUS = "ABIERTO"
 LOCKED_ORDER_STATUSES = {"ABIERTO", "PARCIAL", "RECIBIDO_INFERIDO", "VACIO"}
 ORDER_EDITOR_COLUMNS = ["PART NO", "PCS", "DESCRIPCION", "MARCA"]
 NO_ROTATION_LABEL = "Sin rotacion +3 anios"
+NO_STATUS_LABEL = "SIN STOCK EN ARCHIVO SITUACION"
+NO_ABC_LABEL = "SIN ABC"
 ABC_SORT_ORDER = {"A": 1, "B": 2, "C": 3, NO_ROTATION_LABEL: 4, "Muerto": 4, "Sin historial": 5}
 
 
@@ -472,7 +474,7 @@ def build_mudanza_situation_label(value) -> str:
         return "APARTAR - MUERTO / SIN VALOR"
     if normalized == "ARRIETA":
         return "DEVOLVER - ARRIETA"
-    return "NO ESTA"
+    return NO_STATUS_LABEL
 
 
 def build_mudanza_situation_label_with_abc(situation_value, frecuencia_value) -> str:
@@ -493,7 +495,7 @@ def build_mudanza_situation_label_with_abc(situation_value, frecuencia_value) ->
             return f"REVISAR - FIGURA MUERTO PERO ES ABC {frecuencia}"
         return "APARTAR - MUERTO / SIN VALOR"
 
-    return "NO ESTA"
+    return NO_STATUS_LABEL
 
 
 def normalize_order_number(value) -> str:
@@ -1402,7 +1404,7 @@ def build_mudanza_dataset(
         result["locacion_nodum_status"],
     )
 
-    result["frecuencia_abc"] = result["frecuencia_abc"].fillna("").astype(str).str.strip().replace("", "NO ESTA")
+    result["frecuencia_abc"] = result["frecuencia_abc"].fillna("").astype(str).str.strip().replace("", NO_ABC_LABEL)
     result["situacion_archivo"] = result.get("situacion_archivo", "").fillna("").astype(str).str.strip()
     result["situacion_articulo"] = result.apply(
         lambda row: build_mudanza_situation_label_with_abc(row["situacion_archivo"], row["frecuencia_abc"]),
@@ -3983,6 +3985,106 @@ def build_mudanza_export_df(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def render_consultar_articulo_tab(analysis_month: str):
+    st.subheader("Consultar articulo")
+    st.caption(
+        "Ingresa un codigo de pieza para ver si figura en Mudanza, si esta marcado como muerto, "
+        "si corresponde devolver a Arrieta/Audistock, o si no aparece en el archivo de situacion."
+    )
+
+    mudanza_df = st.session_state.get(f"mudanza_df_{analysis_month}")
+    if not isinstance(mudanza_df, pd.DataFrame) or mudanza_df.empty:
+        st.info(
+            "Todavia no hay datos de Mudanza cargados para consultar. Carga o revisa la pestana Mudanza "
+            "con el inventario y el archivo Stock MUERTO_ARRIETA."
+        )
+        return
+
+    query = st.text_input(
+        "Codigo de articulo",
+        placeholder="Ej: KB8N-51-031H",
+        key=f"consultar_articulo_codigo_{analysis_month}",
+    )
+    query_clean = safe_text(query)
+    if not query_clean:
+        st.info("Escribe un codigo y el sistema buscara coincidencia exacta por codigo normalizado.")
+        return
+
+    query_key = normalize_part_key(query_clean, allow_mazda_compact=True)
+    query_display = normalize_part_display(query_clean, allow_mazda_compact=True)
+
+    df = mudanza_df.copy()
+    df = ensure_part_identity_columns(df, allow_mazda_compact=True)
+    exact_df = df[df["part_key"].astype(str).str.upper() == query_key.upper()].copy()
+
+    if exact_df.empty:
+        needle = query_clean.upper().replace(" ", "")
+        text_mask = (
+            df["part_no"].astype(str).str.upper().str.replace(" ", "", regex=False).str.contains(needle, na=False)
+            | df["part_key"].astype(str).str.upper().str.replace(" ", "", regex=False).str.contains(needle, na=False)
+            | df["description"].astype(str).str.upper().str.contains(query_clean.upper(), na=False)
+        )
+        matches_df = df[text_mask].copy()
+        if matches_df.empty:
+            st.error(f"No encontre el articulo {query_display or query_clean} en la base actual de Mudanza.")
+            st.caption(
+                "Esto significa que no aparecio en el inventario cargado ni en el archivo de situacion usado para esta corrida. "
+                "Revisa guiones, letra final del codigo o que el archivo correcto este cargado."
+            )
+            return
+        st.warning("No hubo coincidencia exacta por codigo normalizado. Muestro coincidencias parciales.")
+        result_df = matches_df
+    else:
+        st.success(f"Articulo encontrado: {query_display or query_clean}")
+        result_df = exact_df
+
+    total_units = float(pd.to_numeric(result_df["stock"], errors="coerce").fillna(0).sum())
+    situations = ", ".join(sorted({safe_text(v) for v in result_df["situacion_articulo"].tolist() if safe_text(v)})) or "-"
+    deposits = ", ".join(sorted({safe_text(v) for v in result_df["deposit_name"].tolist() if safe_text(v)})) or "-"
+
+    col_1, col_2, col_3 = st.columns(3)
+    col_1.metric("Lineas encontradas", f"{len(result_df):,}")
+    col_2.metric("Unidades", f"{total_units:g}")
+    col_3.metric("Deposito", deposits)
+
+    st.write(f"**Situacion:** {situations}")
+
+    display_df = result_df.rename(
+        columns={
+            "deposit_name": "deposito",
+            "part_no": "codigo",
+            "description": "nombre",
+            "stock": "cantidad",
+            "ubicacion": "ubicacion",
+            "locacion_nodum": "locacion_nodum",
+            "frecuencia_abc": "frecuencia_abc",
+            "situacion_archivo": "marca_en_archivo",
+            "situacion_articulo": "situacion",
+            "destino_mudanza": "destino",
+        }
+    )[
+        [
+            "deposito",
+            "codigo",
+            "nombre",
+            "cantidad",
+            "ubicacion",
+            "locacion_nodum",
+            "frecuencia_abc",
+            "marca_en_archivo",
+            "situacion",
+            "destino",
+        ]
+    ]
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    st.caption(
+        "SIN STOCK EN ARCHIVO SITUACION = el codigo esta en la base de Mudanza/inventario, "
+        "pero no tiene stock/situacion cargada como MUERTO, AUDISTOCK o ARRIETA en la planilla de situacion. "
+        "SIN ABC = no se encontro frecuencia A/B/C en el analisis de ventas cargado."
+    )
+
+
 def render_mudanza_tab(
     empresa: str,
     analysis_date: date,
@@ -4041,7 +4143,7 @@ def render_mudanza_tab(
     )
     st.caption(
         "Situacion usa la planilla de estados: AUDISTOCK/ARRIETA = devolver, STOCK MUERTO = apartar; si ademas tiene ABC A/B/C queda como REVISAR, "
-        "si no aparece en esa planilla queda como NO ESTA. La columna Frecuencia mantiene el ABC por separado."
+        "si no aparece en esa planilla queda como SIN STOCK EN ARCHIVO SITUACION. La columna Frecuencia mantiene el ABC por separado; SIN ABC significa que no se encontro en el analisis de ventas."
     )
 
     inventory_frames = []
@@ -4058,6 +4160,7 @@ def render_mudanza_tab(
             status_df=status_df,
             saved_decisions_df=previous_decisions_df,
         )
+        st.session_state[f"mudanza_df_{analysis_month}"] = mudanza_df.copy()
     except Exception as exc:
         st.error(f"No se pudo preparar la pestana de mudanza: {exc}")
         return
@@ -4988,7 +5091,7 @@ def main():
     final_df = pd.DataFrame(columns=["part_no", "description", "abc", "status"])
     inventario_file_for_mudanza = detected_sources.get("inventario")
 
-    pedido_tab, mudanza_tab = st.tabs(["Pedido", "Mudanza"])
+    pedido_tab, mudanza_tab, consulta_tab = st.tabs(["Pedido", "Mudanza", "Consultar articulo"])
 
     with pedido_tab:
         st.info(
@@ -5218,7 +5321,7 @@ def main():
                 )
 
     with mudanza_tab:
-        # Si Pedido no se pudo calcular, Mudanza trabaja igual; en Frecuencia/ABC mostrara NO ESTA.
+        # Si Pedido no se pudo calcular, Mudanza trabaja igual; en Frecuencia/ABC mostrara SIN ABC.
         if not isinstance(final_df, pd.DataFrame) or final_df.empty:
             final_df = pd.DataFrame(columns=["part_no", "description", "abc", "status"])
 
@@ -5230,6 +5333,9 @@ def main():
             default_inventory_file=inventario_file_for_mudanza,
             default_note=save_note,
         )
+
+    with consulta_tab:
+        render_consultar_articulo_tab(analysis_month)
 
 if __name__ == "__main__":
     main()
