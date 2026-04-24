@@ -196,6 +196,87 @@ def normalize_part_plain_key(value) -> str:
     return re.sub(r"[^A-Z0-9]", "", _clean_part_text(value).replace("*", "")).upper()
 
 
+def build_consulta_fingerprint(df: pd.DataFrame) -> str:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return "empty"
+    cols = tuple(str(col) for col in df.columns)
+    return f"{id(df)}|{len(df)}|{cols}"
+
+
+def build_consulta_index_df(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out = ensure_part_identity_columns(out, allow_mazda_compact=True)
+    if "description" not in out.columns:
+        out["description"] = ""
+
+    out["_consulta_key"] = out["part_no"].map(normalize_part_consulta_key).astype(str).str.upper()
+    out["_consulta_key_plain"] = out["_consulta_key"].str.replace("-", "", regex=False).str.upper()
+    out["_part_key_upper"] = out["part_key"].fillna("").astype(str).str.upper()
+    out["_plain_part_no"] = out["part_no"].map(normalize_part_plain_key).astype(str).str.upper()
+    out["_plain_part_key"] = out["part_key"].map(normalize_part_plain_key).astype(str).str.upper()
+    out["_description_upper"] = out["description"].fillna("").astype(str).str.upper()
+    return out
+
+
+def build_consulta_lookup(index_df: pd.DataFrame) -> dict:
+    lookup = {}
+    key_columns = ["_part_key_upper", "_consulta_key", "_consulta_key_plain", "_plain_part_no", "_plain_part_key"]
+    for col in key_columns:
+        if col not in index_df.columns:
+            continue
+        for row_index, value in index_df[col].items():
+            key = safe_text(value).upper()
+            if not key:
+                continue
+            lookup.setdefault(key, set()).add(row_index)
+    return lookup
+
+
+def get_consulta_index(analysis_month: str, mudanza_df: pd.DataFrame):
+    cache_key = f"consulta_index_fast_{analysis_month}"
+    fingerprint = build_consulta_fingerprint(mudanza_df)
+    cached = st.session_state.get(cache_key)
+    if isinstance(cached, dict) and cached.get("fingerprint") == fingerprint:
+        return cached["index_df"], cached["lookup"]
+
+    index_df = build_consulta_index_df(mudanza_df)
+    lookup = build_consulta_lookup(index_df)
+    st.session_state[cache_key] = {
+        "fingerprint": fingerprint,
+        "index_df": index_df,
+        "lookup": lookup,
+    }
+    return index_df, lookup
+
+
+def search_consulta_index(index_df: pd.DataFrame, lookup: dict, query_clean: str):
+    query_key = normalize_part_key(query_clean, allow_mazda_compact=True).upper()
+    query_display = normalize_part_display(query_clean, allow_mazda_compact=True)
+    query_consulta_key = normalize_part_consulta_key(query_clean).upper()
+    query_plain_key = normalize_part_plain_key(query_clean).upper()
+
+    exact_keys = {key for key in [query_key, query_consulta_key, query_plain_key] if key}
+    matched_indices = set()
+    for key in exact_keys:
+        matched_indices.update(lookup.get(key, set()))
+
+    if matched_indices:
+        result_df = index_df.loc[sorted(matched_indices)].copy()
+        return result_df, "exact", query_display, query_key, query_consulta_key, query_plain_key
+
+    needle = query_plain_key
+    if not needle:
+        return index_df.iloc[0:0].copy(), "empty", query_display, query_key, query_consulta_key, query_plain_key
+
+    text_mask = (
+        index_df["_plain_part_no"].astype(str).str.contains(needle, na=False)
+        | index_df["_plain_part_key"].astype(str).str.contains(needle, na=False)
+        | index_df["_consulta_key_plain"].astype(str).str.contains(needle, na=False)
+        | index_df["_description_upper"].astype(str).str.contains(query_clean.upper(), na=False)
+    )
+    return index_df[text_mask].copy(), "partial", query_display, query_key, query_consulta_key, query_plain_key
+
+
 def choose_latest_part_code(values, allow_mazda_compact: bool = False) -> str:
     infos = [
         parse_part_code(value, allow_mazda_compact=allow_mazda_compact)
@@ -4212,64 +4293,55 @@ def render_consultar_articulo_tab(analysis_month: str):
         )
         return
 
-    query = st.text_input(
-        "Codigo de articulo",
-        placeholder="Ej: KB8N-51-031H",
-        key=f"consultar_articulo_codigo_{analysis_month}",
-    )
-    query_clean = safe_text(query)
+    index_df, lookup = get_consulta_index(analysis_month, mudanza_df)
+    st.caption("Busqueda rapida activada: el indice se arma una sola vez y luego la consulta va directo al codigo/base.")
+
+    form_key = f"consultar_articulo_form_{analysis_month}"
+    last_query_key = f"consultar_articulo_ultima_{analysis_month}"
+    with st.form(form_key, clear_on_submit=False):
+        query = st.text_input(
+            "Codigo de articulo",
+            placeholder="Ej: B631-14-302, B631-14-302A, MDX9-85-0683",
+            key=f"consultar_articulo_codigo_{analysis_month}",
+        )
+        submitted = st.form_submit_button("Consultar", type="primary")
+
+    if submitted:
+        st.session_state[last_query_key] = query
+
+    query_clean = safe_text(st.session_state.get(last_query_key, ""))
     if not query_clean:
-        st.info("Escribe un codigo. El sistema busca el codigo exacto y tambien variantes Mazda por base, por ejemplo B631-14-302 = B631-14-302A = B631-14-302C02.")
+        st.info(
+            "Escribe un codigo y presiona Consultar. El sistema busca el codigo exacto y tambien variantes Mazda por base, "
+            "por ejemplo B631-14-302 = B631-14-302A = B631-14-302C02."
+        )
         return
 
-    query_key = normalize_part_key(query_clean, allow_mazda_compact=True)
-    query_display = normalize_part_display(query_clean, allow_mazda_compact=True)
-    query_consulta_key = normalize_part_consulta_key(query_clean)
-    query_plain_key = normalize_part_plain_key(query_clean)
+    result_df, match_type, query_display, query_key, query_consulta_key, query_plain_key = search_consulta_index(
+        index_df,
+        lookup,
+        query_clean,
+    )
 
-    df = mudanza_df.copy()
-    df = ensure_part_identity_columns(df, allow_mazda_compact=True)
-    df["_consulta_key"] = df["part_no"].map(normalize_part_consulta_key)
-    df["_part_key_upper"] = df["part_key"].astype(str).str.upper()
-    df["_plain_part_no"] = df["part_no"].map(normalize_part_plain_key)
-    df["_plain_part_key"] = df["part_key"].map(normalize_part_plain_key)
-
-    exact_df = df[
-        (df["_part_key_upper"] == query_key.upper())
-        | (df["_consulta_key"] == query_consulta_key)
-        | (df["_plain_part_no"] == query_plain_key)
-        | (df["_plain_part_key"] == query_plain_key)
-    ].copy()
-
-    if exact_df.empty:
-        needle = query_plain_key
-        text_mask = (
-            df["_plain_part_no"].astype(str).str.contains(needle, na=False)
-            | df["_plain_part_key"].astype(str).str.contains(needle, na=False)
-            | df["_consulta_key"].astype(str).str.replace("-", "", regex=False).str.contains(needle, na=False)
-            | df["description"].astype(str).str.upper().str.contains(query_clean.upper(), na=False)
+    if result_df.empty:
+        st.error(f"No encontre el articulo {query_display or query_clean} en la base actual de Mudanza.")
+        st.caption(
+            "Esto significa que no aparecio en el inventario cargado ni en el archivo de situacion usado para esta corrida. "
+            "Tambien se comparan las variantes Mazda por codigo base: por ejemplo "
+            "B631-14-302, B631-14-302A y B631-14-302C02 se consideran el mismo articulo."
         )
-        matches_df = df[text_mask].copy()
-        if matches_df.empty:
-            st.error(f"No encontre el articulo {query_display or query_clean} en la base actual de Mudanza.")
-            st.caption(
-                "Esto significa que no aparecio en el inventario cargado ni en el archivo de situacion usado para esta corrida. "
-                "Ahora tambien se comparan las variantes Mazda por codigo base: por ejemplo "
-                "B631-14-302, B631-14-302A y B631-14-302C02 se consideran el mismo articulo."
-            )
-            return
+        return
+
+    if match_type == "partial":
         st.warning("No hubo coincidencia exacta. Muestro coincidencias parciales por codigo o descripcion.")
-        result_df = matches_df
+    elif query_consulta_key and query_consulta_key != query_key:
+        st.success(f"Articulo encontrado por codigo base: {query_consulta_key}")
+        st.caption(
+            "Para codigos Mazda se comparan los primeros 11 caracteres del formato 4-2-3. "
+            "Ejemplo: B631-14-302 coincide con B631-14-302A o B631-14-302C02."
+        )
     else:
-        if query_consulta_key and query_consulta_key != query_key.upper():
-            st.success(f"Articulo encontrado por codigo base: {query_consulta_key}")
-            st.caption(
-                "Para codigos Mazda se comparan los primeros 11 caracteres del formato 4-2-3. "
-                "Ejemplo: B631-14-302 coincide con B631-14-302A o B631-14-302C02."
-            )
-        else:
-            st.success(f"Articulo encontrado: {query_display or query_clean}")
-        result_df = exact_df
+        st.success(f"Articulo encontrado: {query_display or query_clean}")
 
     total_units = float(pd.to_numeric(result_df["stock"], errors="coerce").fillna(0).sum())
     situations = ", ".join(sorted({safe_text(v) for v in result_df["situacion_articulo"].tolist() if safe_text(v)})) or "-"
