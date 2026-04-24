@@ -469,24 +469,121 @@ def normalize_mudanza_situation(value) -> str:
 
 
 def build_mudanza_situation_label(value) -> str:
-    """Etiqueta operativa segun el archivo Stock MUERTO_ARRIETA.
-
-    Regla actual:
-    - Comentario AUDISTOCK / ARRIETA => DEVOLVER - ARRIETA.
-    - Comentario STOCK MUERTO / MUERTO => APARTAR - STOCK MUERTO PARA DEVOLVER.
-    La frecuencia ABC queda como dato separado; no cambia la situacion solicitada por el archivo.
-    """
     normalized = normalize_mudanza_situation(value)
     if normalized == "MUERTO":
-        return "APARTAR - STOCK MUERTO PARA DEVOLVER"
+        return "APARTAR - MUERTO / SIN VALOR"
     if normalized == "ARRIETA":
         return "DEVOLVER - ARRIETA"
     return NO_STATUS_LABEL
 
 
-def build_mudanza_situation_label_with_abc(situation_value, frecuencia_value) -> str:
-    # Se conserva la firma para no romper llamadas existentes, pero la decision ya no se pisa por ABC.
-    return build_mudanza_situation_label(situation_value)
+def _normalize_for_keyword_search(value) -> str:
+    """Normaliza texto para buscar palabras clave sin depender de acentos ni signos."""
+    text = safe_text(value).upper()
+    replacements = {
+        "Á": "A",
+        "É": "E",
+        "Í": "I",
+        "Ó": "O",
+        "Ú": "U",
+        "Ü": "U",
+        "Ñ": "N",
+    }
+    for old_char, new_char in replacements.items():
+        text = text.replace(old_char, new_char)
+    text = re.sub(r"[^A-Z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_abc_frequency(value) -> str:
+    """Devuelve A, B o C cuando la frecuencia del analisis es valida."""
+    text = safe_text(value).upper().strip()
+    if text in {"A", "B", "C"}:
+        return text
+    return ""
+
+
+def classify_mudanza_product_family(description_value, part_no_value="") -> str:
+    """Clasifica el articulo para decidir destino si era STOCK MUERTO pero el ABC dice que rota."""
+    text = _normalize_for_keyword_search(f"{description_value} {part_no_value}")
+    if not text:
+        return "SIN_CLASIFICAR"
+
+    body_keywords = [
+        "CARROCERIA", "ESPOLON", "SPOILER", "GUARDABARRO", "GUARDA BARRO", "FENDER",
+        "PARABRISAS", "WINDSHIELD", "MOLDURA", "MOLDING", "MOULDING", "OPTICA",
+        "SEMI OPTICA", "SEMIOPTICA", "FAROL", "FARO", "LAMP", "HEAD LAMP", "HEADLAMP",
+        "TAIL LAMP", "TAILLAMP", "STOP LAMP", "BUMPER", "PARAGOLPE", "CAPOT", "HOOD",
+        "PUERTA", "DOOR", "TAPA BAUL", "TRUNK LID", "PANEL", "REJILLA", "GRILLE", "GRILL",
+        "ESPEJO", "MIRROR", "CRISTAL", "VIDRIO", "GLASS", "GUARDAFANGO", "LODERA",
+    ]
+    service_keywords = [
+        "AMORTIGUADOR", "SHOCK", "STRUT", "FILTRO", "FILTER", "ACEITE", "OIL", "POLEN",
+        "CABIN", "BUJIA", "SPARK PLUG", "PASTILLA", "PASTILLAS", "BRAKE PAD",
+        "DISCO FRENO", "DISCO DE FRENO", "BRAKE DISC", "BRAKE ROTOR", "ROTOR", "CORREA",
+        "BELT", "TENSOR", "TENSIONER", "ESCOBILLA", "WIPER", "LIMPIAPARABRISAS",
+        "ZAPATA", "BRAKE SHOE", "FRENO", "FRENOS", "KIT DISTRIBUCION", "DISTRIBUCION",
+    ]
+
+    def has_keyword(keywords):
+        padded = f" {text} "
+        for keyword in keywords:
+            normalized_keyword = _normalize_for_keyword_search(keyword)
+            if f" {normalized_keyword} " in padded or normalized_keyword in text:
+                return True
+        return False
+
+    # Primero carroceria: FARO/OPTICA/LAMP/MOLDURA/etc. deben ir al Polo Logistico.
+    if has_keyword(body_keywords):
+        return "CARROCERIA"
+    if has_keyword(service_keywords):
+        return "SERVICE"
+    return "SIN_CLASIFICAR"
+
+
+def build_mudanza_situation_label_with_abc(situation_value, frecuencia_value, description_value="", part_no_value="") -> str:
+    """Etiqueta operativa final combinando Comentario + frecuencia del analisis.
+
+    Reglas:
+    - AUDISTOCK / ARRIETA => DEVOLVER - ARRIETA.
+    - STOCK MUERTO + frecuencia A/B/C + service => FRECUENCIA A/B/C - SERVICE - SEGUN ANALISIS.
+    - STOCK MUERTO + frecuencia A/B/C + carroceria => FRECUENCIA A/B/C - CARROCERIA - SEGUN ANALISIS.
+    - STOCK MUERTO + frecuencia A/B/C sin clasificar => FRECUENCIA A/B/C - SEGUN ANALISIS.
+    - STOCK MUERTO sin frecuencia A/B/C => APARTAR - STOCK MUERTO PARA DEVOLVER.
+    """
+    normalized = normalize_mudanza_situation(situation_value)
+    frecuencia = normalize_abc_frequency(frecuencia_value)
+
+    if normalized == "ARRIETA":
+        return "DEVOLVER - ARRIETA"
+
+    if normalized == "MUERTO":
+        if frecuencia:
+            product_family = classify_mudanza_product_family(description_value, part_no_value)
+            if product_family == "CARROCERIA":
+                return f"FRECUENCIA {frecuencia} - CARROCERIA - SEGUN ANALISIS"
+            if product_family == "SERVICE":
+                return f"FRECUENCIA {frecuencia} - SERVICE - SEGUN ANALISIS"
+            return f"FRECUENCIA {frecuencia} - SEGUN ANALISIS"
+        return "APARTAR - STOCK MUERTO PARA DEVOLVER"
+
+    return NO_STATUS_LABEL
+
+
+def suggest_mudanza_destination(situation_label: str, current_destination: str = "") -> str:
+    """Precarga destino cuando la regla es directa, sin pisar decisiones ya guardadas."""
+    current = safe_text(current_destination)
+    if current and current != "Pendiente" and current in MUDANZA_DESTINATIONS:
+        return current
+
+    situation = safe_text(situation_label).upper()
+    if situation == "DEVOLVER - ARRIETA":
+        return "Arrieta"
+    if situation.startswith("FRECUENCIA ") and "CARROCERIA" in situation:
+        return "Polo Logistico"
+    if situation.startswith("FRECUENCIA "):
+        return "Darkinel"
+    return "Pendiente"
 
 
 def build_mudanza_stock_control_label(row) -> str:
@@ -1251,8 +1348,8 @@ def load_mudanza_status(uploaded_file) -> pd.DataFrame:
 
     status_df["stock_status"] = pd.to_numeric(status_df["stock_status"], errors="coerce").fillna(0.0)
 
-    # Prioridad nueva: la hoja STOCK, columna Comentario, manda. Alli el usuario ya definio
-    # AUDISTOCK o STOCK MUERTO por codigo. Las otras hojas solo completan codigos que no esten en STOCK.
+    # La hoja STOCK, columna Comentario, manda: alli el usuario ya definio AUDISTOCK o STOCK MUERTO.
+    # Las otras hojas completan codigos que no esten definidos en STOCK.
     source_priority = {
         "STOCK": 100,
         "STOCK MUERTO": 80,
@@ -1401,7 +1498,6 @@ def build_mudanza_dataset(
         result["stock_status"] = 0.0
         result["ubicacion_status"] = ""
         result["locacion_nodum_status"] = ""
-        result["fuente_status"] = ""
 
     if saved_decisions_df is not None and not saved_decisions_df.empty:
         saved_choices = saved_decisions_df.copy()
@@ -1451,11 +1547,20 @@ def build_mudanza_dataset(
     result["diferencia_stock"] = result["stock"] - result["stock_archivo_situacion"]
     result["control_stock"] = result.apply(build_mudanza_stock_control_label, axis=1)
     result["situacion_articulo"] = result.apply(
-        lambda row: build_mudanza_situation_label_with_abc(row["situacion_archivo"], row["frecuencia_abc"]),
+        lambda row: build_mudanza_situation_label_with_abc(
+            row["situacion_archivo"],
+            row["frecuencia_abc"],
+            row["description"],
+            row["part_no"],
+        ),
         axis=1,
     )
     result["destino_mudanza"] = result["destino_mudanza"].fillna("").astype(str).str.strip()
     result.loc[~result["destino_mudanza"].isin(MUDANZA_DESTINATIONS), "destino_mudanza"] = "Pendiente"
+    result["destino_mudanza"] = result.apply(
+        lambda row: suggest_mudanza_destination(row["situacion_articulo"], row["destino_mudanza"]),
+        axis=1,
+    )
 
     result["stock"] = pd.to_numeric(result["stock"], errors="coerce").fillna(0)
     result = result[result["stock"] > 0].copy()
@@ -4150,8 +4255,8 @@ def render_consultar_articulo_tab(analysis_month: str):
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     st.caption(
-        "Control stock compara cantidad del inventario cargado contra la columna stock del archivo Stock MUERTO_ARRIETA. "
-        "OK = coincide; DIFERENCIA = no coincide; SOLO EN ARCHIVO SITUACION = el codigo no aparecio en el inventario cargado. "
+        "SIN STOCK EN ARCHIVO SITUACION = el codigo esta en la base de Mudanza/inventario, "
+        "pero no figura marcado como MUERTO, AUDISTOCK o ARRIETA en la planilla de situacion. "
         "SIN ABC = no se encontro frecuencia A/B/C en el analisis de ventas cargado."
     )
 
@@ -4213,8 +4318,11 @@ def render_mudanza_tab(
         hide_index=True,
     )
     st.caption(
-        "Situacion usa la columna Comentario del archivo Stock MUERTO_ARRIETA: AUDISTOCK = DEVOLVER - ARRIETA; STOCK MUERTO = APARTAR - STOCK MUERTO PARA DEVOLVER. "
-        "Control stock compara la cantidad del inventario cargado contra la columna stock de esa planilla. La columna Frecuencia mantiene el ABC por separado; SIN ABC significa que no se encontro en el analisis de ventas."
+        "Situacion usa la columna Comentario del archivo Stock MUERTO_ARRIETA: AUDISTOCK = DEVOLVER - ARRIETA; "
+        "STOCK MUERTO con frecuencia A/B/C se mantiene segun el analisis. "
+        "Si es SERVICE queda en Darkinel; si es CARROCERIA va a Polo Logistico. "
+        "STOCK MUERTO sin frecuencia A/B/C queda como APARTAR - STOCK MUERTO PARA DEVOLVER. "
+        "Control stock compara la cantidad del inventario cargado contra la columna stock de esa planilla."
     )
 
     inventory_frames = []
@@ -4256,7 +4364,11 @@ def render_mudanza_tab(
         summary_col_1.caption("Resumen por deposito")
         summary_col_1.dataframe(
             mudanza_df.groupby(["deposit_code", "deposit_name"], as_index=False)
-            .agg(articulos=("part_no", "count"), unidades=("stock", "sum"))
+            .agg(
+                articulos=("part_no", "count"),
+                unidades_inventario=("stock", "sum"),
+                unidades_archivo_situacion=("stock_archivo_situacion", "sum"),
+            )
             .sort_values(["deposit_code", "deposit_name"]),
             use_container_width=True,
             hide_index=True,
@@ -4264,11 +4376,7 @@ def render_mudanza_tab(
         summary_col_2.caption("Resumen por situacion")
         summary_col_2.dataframe(
             mudanza_df.groupby("situacion_articulo", as_index=False)
-            .agg(
-                articulos=("part_no", "count"),
-                unidades_inventario=("stock", "sum"),
-                unidades_archivo_situacion=("stock_archivo_situacion", "sum"),
-            )
+            .agg(articulos=("part_no", "count"), unidades=("stock", "sum"))
             .sort_values(["situacion_articulo"]),
             use_container_width=True,
             hide_index=True,
