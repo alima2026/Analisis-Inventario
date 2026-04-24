@@ -26,7 +26,8 @@ DEFAULT_COMPANY = "Magna"
 AUTO_ORDER_FOLDER = APP_DIR / "Pedidos Solicitados"
 DEPOSIT_LABELS = {
     "D012": "Darkinel Central",
-    "D122": "Deposito Panol",
+    "D122": "Pañol Darkinel",
+    "D0122": "Pañol Darkinel",
 }
 MUDANZA_DESTINATIONS = ["Pendiente", "Polo Logistico", "Darkinel"]
 EDITABLE_ORDER_SOURCE_TYPE = "pedido_editable_mazda"
@@ -400,6 +401,21 @@ def safe_text(value) -> str:
     if pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def canonicalize_deposit_code(value) -> str:
+    text = safe_text(value).upper()
+    if not text:
+        return ""
+    if text in {"D0122", "D122"}:
+        return "D122"
+    if any(marker in text for marker in ["PAÑOL", "PAÃ‘OL", "PANOL"]):
+        return "D122"
+    if "D0122" in text:
+        return "D122"
+    if "D012" in text:
+        return "D012"
+    return text
 
 
 def normalize_inventory_quality(value) -> str:
@@ -805,21 +821,64 @@ def load_inventory(uploaded_file) -> pd.DataFrame:
 
 
 def detect_inventory_deposit_from_raw(raw: pd.DataFrame, source_name: str = "") -> str:
-    preview = raw.iloc[:8].fillna("").astype(str)
-    header_text = " ".join(preview.to_numpy().ravel()).upper()
+    preview = raw.iloc[:12].copy()
+    header_text = " ".join(
+        text for text in (safe_text(value).upper() for value in preview.to_numpy().ravel()) if text
+    )
     source_text = safe_text(source_name).upper()
 
-    for code in DEPOSIT_LABELS:
-        if code in header_text or code in source_text:
-            return code
-
-    if "DARKINEL" in header_text or "DARKINEL" in source_text:
-        return "D012"
+    if any(code in header_text for code in ["D0122", "D122"]) or any(code in source_text for code in ["D0122", "D122"]):
+        return "D122"
     if any(marker in header_text for marker in ["PAÑOL", "PANOL"]) or any(
         marker in source_text for marker in ["PAÑOL", "PANOL"]
     ):
         return "D122"
+
+    if "DARKINEL" in header_text or "DARKINEL" in source_text:
+        return "D012"
+    if "D012" in header_text or "D012" in source_text:
+        return "D012"
     return ""
+
+
+def extract_inventory_block(raw: pd.DataFrame, requested_deposit_code: str = "") -> tuple[pd.DataFrame, str]:
+    requested_code = canonicalize_deposit_code(requested_deposit_code)
+    headers = []
+
+    for idx in raw.index:
+        row_text = " ".join(
+            text for text in (safe_text(value).upper() for value in raw.loc[idx].tolist()) if text
+        )
+        if "DEPOSITO" not in row_text:
+            continue
+        detected_code = canonicalize_deposit_code(row_text)
+        if detected_code:
+            headers.append((int(idx), detected_code))
+
+    if not headers:
+        detected = canonicalize_deposit_code(requested_code or detect_inventory_deposit_from_raw(raw))
+        return raw.copy(), detected
+
+    selected_headers = headers
+    if requested_code:
+        matching_headers = [item for item in headers if item[1] == requested_code]
+        if matching_headers:
+            selected_headers = matching_headers
+
+    blocks = []
+    for header_idx, _ in selected_headers:
+        next_candidates = [idx for idx, __ in headers if idx > header_idx]
+        next_header_idx = min(next_candidates) if next_candidates else len(raw)
+        block = raw.iloc[header_idx + 2:next_header_idx].copy()
+        if not block.empty:
+            blocks.append(block)
+
+    if not blocks:
+        detected = selected_headers[0][1] if selected_headers else canonicalize_deposit_code(detect_inventory_deposit_from_raw(raw))
+        return raw.copy(), detected
+
+    detected = selected_headers[0][1] if selected_headers else canonicalize_deposit_code(detect_inventory_deposit_from_raw(raw))
+    return pd.concat(blocks, ignore_index=True), detected
 
 
 def empty_mudanza_items_df() -> pd.DataFrame:
@@ -843,12 +902,14 @@ def empty_mudanza_items_df() -> pd.DataFrame:
 
 def load_mudanza_inventory(uploaded_file, fallback_deposit_code: str = "") -> pd.DataFrame:
     raw = pd.read_excel(clone_excel_source(uploaded_file), header=None)
-    deposit_code = detect_inventory_deposit_from_raw(raw, getattr(uploaded_file, "name", ""))
-    deposit_code = deposit_code or safe_text(fallback_deposit_code).upper()
+    requested_code = canonicalize_deposit_code(fallback_deposit_code)
+    inventory_block, detected_code = extract_inventory_block(raw, requested_code)
+    deposit_code = detected_code or detect_inventory_deposit_from_raw(raw, getattr(uploaded_file, "name", ""))
+    deposit_code = canonicalize_deposit_code(deposit_code or requested_code or safe_text(fallback_deposit_code).upper())
     deposit_code = deposit_code or "SIN_DEP"
     deposit_name = DEPOSIT_LABELS.get(deposit_code, deposit_code)
 
-    df = raw.iloc[5:, [2, 8, 16, 20]].copy()
+    df = inventory_block.iloc[:, [2, 8, 16, 20]].copy()
     df.columns = ["part_no", "description", "unit", "stock"]
     df = df.dropna(subset=["part_no"]).copy()
     df = add_part_identity(df, "part_no", allow_mazda_compact=True)
@@ -3732,7 +3793,7 @@ def render_mudanza_tab(
     render_mudanza_feedback()
     st.subheader("Mudanza")
     st.caption(
-        "Analiza stock de D012 (Darkinel Central) y D122 (Deposito Panol), cruza ABC y situacion del articulo, "
+        "Analiza stock de D012 (Darkinel Central) y D0122 (Pañol Darkinel), cruza ABC y situacion del articulo, "
         "y te deja decidir si cada pieza va al Polo Logistico o se queda en Darkinel."
     )
 
@@ -3743,7 +3804,7 @@ def render_mudanza_tab(
         key=f"mudanza_inventory_d012_{analysis_month}",
     )
     inventory_d122_upload = source_col_2.file_uploader(
-        "Inventario D122 / Deposito Panol (opcional)",
+        "Inventario D0122 / Pañol Darkinel (opcional)",
         type=["xls", "xlsx"],
         key=f"mudanza_inventory_d122_{analysis_month}",
     )
@@ -3765,7 +3826,7 @@ def render_mudanza_tab(
                     "archivo": inventory_d012_file.name if inventory_d012_file is not None else "No cargado",
                 },
                 {
-                    "fuente": "Inventario D122",
+                    "fuente": "Inventario D0122",
                     "archivo": inventory_d122_file.name if inventory_d122_file is not None else "No cargado",
                 },
                 {
@@ -3783,7 +3844,7 @@ def render_mudanza_tab(
         if inventory_d012_file is not None:
             inventory_frames.append(load_mudanza_inventory(inventory_d012_file, fallback_deposit_code="D012"))
         if inventory_d122_file is not None:
-            inventory_frames.append(load_mudanza_inventory(inventory_d122_file, fallback_deposit_code="D122"))
+            inventory_frames.append(load_mudanza_inventory(inventory_d122_file, fallback_deposit_code="D0122"))
         status_df = load_mudanza_status(status_file) if status_file is not None else pd.DataFrame()
         previous_decisions_df = load_latest_mudanza_decisions(empresa)
         mudanza_df = build_mudanza_dataset(
@@ -3798,7 +3859,7 @@ def render_mudanza_tab(
 
     if mudanza_df.empty:
         st.info(
-            "Carga al menos un inventario D012 o D122 con stock positivo para trabajar la mudanza. "
+            "Carga al menos un inventario D012 o D0122 con stock positivo para trabajar la mudanza. "
             "El archivo de situacion es opcional, pero recomendado."
         )
     else:
