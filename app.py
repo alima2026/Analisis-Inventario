@@ -24,6 +24,11 @@ DEFAULT_LEAD_TIME_MONTHS = 6
 DEFAULT_CAPITAL = 500000.0
 DEFAULT_COMPANY = "Magna"
 AUTO_ORDER_FOLDER = APP_DIR / "Pedidos Solicitados"
+DEPOSIT_LABELS = {
+    "D012": "Darkinel Central",
+    "D122": "Deposito Panol",
+}
+MUDANZA_DESTINATIONS = ["Pendiente", "Polo Logistico", "Darkinel"]
 EDITABLE_ORDER_SOURCE_TYPE = "pedido_editable_mazda"
 FINAL_MAZDA_ORDER_SOURCE_TYPE = "pedido_final_mazda"
 ORDER_DRAFT_STATUS = "BORRADOR"
@@ -395,6 +400,34 @@ def safe_text(value) -> str:
     return str(value).strip()
 
 
+def clone_excel_source(source_file):
+    if hasattr(source_file, "getvalue"):
+        return BytesIO(source_file.getvalue())
+    return source_file
+
+
+def join_unique_text(values, separator: str = " | ") -> str:
+    seen = []
+    for value in values:
+        text = safe_text(value)
+        if text and text not in seen:
+            seen.append(text)
+    return separator.join(seen)
+
+
+def normalize_mudanza_situation(value) -> str:
+    text = safe_text(value).upper()
+    if not text:
+        return ""
+    if "MUERTO" in text:
+        return "MUERTO"
+    if "ARRIETA" in text:
+        return "ARRIETA"
+    if "AUDISTOCK" in text:
+        return "AUDISTOCK"
+    return ""
+
+
 def normalize_order_number(value) -> str:
     return re.sub(r"\s+", "", safe_text(value).upper())
 
@@ -714,6 +747,360 @@ def load_inventory(uploaded_file) -> pd.DataFrame:
             stock=("stock", "sum"),
         )
     )
+
+
+def detect_inventory_deposit_from_raw(raw: pd.DataFrame, source_name: str = "") -> str:
+    preview = raw.iloc[:8].fillna("").astype(str)
+    header_text = " ".join(preview.to_numpy().ravel()).upper()
+    source_text = safe_text(source_name).upper()
+
+    for code in DEPOSIT_LABELS:
+        if code in header_text or code in source_text:
+            return code
+
+    if "DARKINEL" in header_text or "DARKINEL" in source_text:
+        return "D012"
+    if any(marker in header_text for marker in ["PAÑOL", "PANOL"]) or any(
+        marker in source_text for marker in ["PAÑOL", "PANOL"]
+    ):
+        return "D122"
+    return ""
+
+
+def empty_mudanza_items_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "deposit_code",
+            "deposit_name",
+            "part_key",
+            "part_no",
+            "description",
+            "stock",
+            "ubicacion",
+            "locacion_nodum",
+            "frecuencia_abc",
+            "situacion_archivo",
+            "situacion_articulo",
+            "destino_mudanza",
+        ]
+    )
+
+
+def load_mudanza_inventory(uploaded_file, fallback_deposit_code: str = "") -> pd.DataFrame:
+    raw = pd.read_excel(clone_excel_source(uploaded_file), header=None)
+    deposit_code = detect_inventory_deposit_from_raw(raw, getattr(uploaded_file, "name", ""))
+    deposit_code = deposit_code or safe_text(fallback_deposit_code).upper()
+    deposit_code = deposit_code or "SIN_DEP"
+    deposit_name = DEPOSIT_LABELS.get(deposit_code, deposit_code)
+
+    df = raw.iloc[5:, [2, 8, 16, 20]].copy()
+    df.columns = ["part_no", "description", "unit", "stock"]
+    df = df.dropna(subset=["part_no"]).copy()
+    df = add_part_identity(df, "part_no", allow_mazda_compact=True)
+    df["description"] = df["description"].astype(str).str.strip()
+    df["stock"] = safe_numeric(df["stock"])
+    df = df[(df["part_key"] != "") & (df["stock"] > 0)].copy()
+
+    if df.empty:
+        return empty_mudanza_items_df()
+
+    df["deposit_code"] = deposit_code
+    df["deposit_name"] = deposit_name
+    grouped = (
+        df.groupby(["deposit_code", "deposit_name", "part_key"], as_index=False)
+        .agg(
+            part_no=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
+            description=("description", first_non_empty),
+            stock=("stock", "sum"),
+        )
+    )
+    grouped["ubicacion"] = ""
+    grouped["locacion_nodum"] = ""
+    grouped["frecuencia_abc"] = ""
+    grouped["situacion_archivo"] = ""
+    grouped["situacion_articulo"] = ""
+    grouped["destino_mudanza"] = "Pendiente"
+    return grouped[empty_mudanza_items_df().columns]
+
+
+def load_mudanza_status(uploaded_file) -> pd.DataFrame:
+    frames = []
+
+    try:
+        stock_sheet = pd.read_excel(clone_excel_source(uploaded_file), sheet_name="STOCK")
+        if "part_no" in stock_sheet.columns:
+            stock_sheet = stock_sheet.copy()
+            stock_sheet = add_part_identity(stock_sheet, "part_no", allow_mazda_compact=True)
+            stock_sheet["comentario_origen"] = stock_sheet.get(
+                "Comentario", pd.Series("", index=stock_sheet.index)
+            ).fillna("")
+            stock_sheet["situacion_archivo"] = stock_sheet.get(
+                "Comentario", pd.Series("", index=stock_sheet.index)
+            ).map(normalize_mudanza_situation)
+            stock_sheet["locacion_nodum"] = stock_sheet.get(
+                "LOCACION NODUM", pd.Series("", index=stock_sheet.index)
+            ).fillna("").astype(str)
+            stock_sheet["ubicacion_actual"] = stock_sheet.get(
+                "UBICACIÓN ACTUAL INCOMPLETOS", pd.Series("", index=stock_sheet.index)
+            ).fillna("").astype(str)
+            stock_sheet["ubicacion"] = stock_sheet[["locacion_nodum", "ubicacion_actual"]].apply(first_non_empty, axis=1)
+            stock_sheet["description_status"] = ""
+            stock_sheet["fuente_status"] = "STOCK"
+            stock_sheet["comentarios_archivo"] = stock_sheet["comentario_origen"].astype(str)
+            frames.append(
+                stock_sheet[
+                    [
+                        "part_key",
+                        "part_no",
+                        "description_status",
+                        "situacion_archivo",
+                        "ubicacion",
+                        "locacion_nodum",
+                        "comentarios_archivo",
+                        "fuente_status",
+                    ]
+                ]
+            )
+    except Exception:
+        pass
+
+    try:
+        stock_muerto_sheet = pd.read_excel(clone_excel_source(uploaded_file), sheet_name="STOCK MUERTO")
+        if "part_no" in stock_muerto_sheet.columns:
+            stock_muerto_sheet = add_part_identity(stock_muerto_sheet, "part_no", allow_mazda_compact=True)
+            stock_muerto_sheet["description_status"] = stock_muerto_sheet.get(
+                "description", pd.Series("", index=stock_muerto_sheet.index)
+            ).fillna("").astype(str)
+            stock_muerto_sheet["situacion_archivo"] = "MUERTO"
+            stock_muerto_sheet["ubicacion"] = ""
+            stock_muerto_sheet["locacion_nodum"] = ""
+            stock_muerto_sheet["comentarios_archivo"] = "STOCK MUERTO"
+            stock_muerto_sheet["fuente_status"] = "STOCK MUERTO"
+            frames.append(
+                stock_muerto_sheet[
+                    [
+                        "part_key",
+                        "part_no",
+                        "description_status",
+                        "situacion_archivo",
+                        "ubicacion",
+                        "locacion_nodum",
+                        "comentarios_archivo",
+                        "fuente_status",
+                    ]
+                ]
+            )
+    except Exception:
+        pass
+
+    try:
+        arrieta_sheet = pd.read_excel(clone_excel_source(uploaded_file), sheet_name="ARRIETA")
+        if "part_no" in arrieta_sheet.columns:
+            arrieta_sheet = add_part_identity(arrieta_sheet, "part_no", allow_mazda_compact=True)
+            arrieta_sheet["description_status"] = ""
+            arrieta_sheet["situacion_archivo"] = "ARRIETA"
+            arrieta_sheet["ubicacion"] = ""
+            arrieta_sheet["locacion_nodum"] = ""
+            arrieta_sheet["comentarios_archivo"] = "ARRIETA"
+            arrieta_sheet["fuente_status"] = "ARRIETA"
+            frames.append(
+                arrieta_sheet[
+                    [
+                        "part_key",
+                        "part_no",
+                        "description_status",
+                        "situacion_archivo",
+                        "ubicacion",
+                        "locacion_nodum",
+                        "comentarios_archivo",
+                        "fuente_status",
+                    ]
+                ]
+            )
+    except Exception:
+        pass
+
+    try:
+        audistock_sheet = pd.read_excel(clone_excel_source(uploaded_file), sheet_name="Audistock", header=2)
+        if "Codigo" in audistock_sheet.columns:
+            audistock_sheet = audistock_sheet.dropna(subset=["Codigo"]).copy()
+            audistock_sheet = add_part_identity(audistock_sheet, "Codigo", allow_mazda_compact=True)
+            audistock_sheet["description_status"] = audistock_sheet.get(
+                "Descripcion", pd.Series("", index=audistock_sheet.index)
+            ).fillna("").astype(str)
+            audistock_sheet["situacion_archivo"] = "AUDISTOCK"
+            audistock_sheet["ubicacion"] = ""
+            audistock_sheet["locacion_nodum"] = ""
+            audistock_sheet["comentarios_archivo"] = "AUDISTOCK"
+            audistock_sheet["fuente_status"] = "Audistock"
+            frames.append(
+                audistock_sheet[
+                    [
+                        "part_key",
+                        "part_no",
+                        "description_status",
+                        "situacion_archivo",
+                        "ubicacion",
+                        "locacion_nodum",
+                        "comentarios_archivo",
+                        "fuente_status",
+                    ]
+                ]
+            )
+    except Exception:
+        pass
+
+    if not frames:
+        return pd.DataFrame(
+            columns=[
+                "part_key",
+                "part_no",
+                "description_status",
+                "situacion_archivo",
+                "ubicacion",
+                "locacion_nodum",
+                "comentarios_archivo",
+                "fuente_status",
+            ]
+        )
+
+    status_df = pd.concat(frames, ignore_index=True)
+    status_df = status_df[status_df["part_key"].astype(str).str.strip() != ""].copy()
+    if status_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "part_key",
+                "part_no",
+                "description_status",
+                "situacion_archivo",
+                "ubicacion",
+                "locacion_nodum",
+                "comentarios_archivo",
+                "fuente_status",
+            ]
+        )
+
+    priority_map = {"MUERTO": 30, "ARRIETA": 20, "AUDISTOCK": 10}
+    status_df["priority"] = status_df["situacion_archivo"].map(priority_map).fillna(0)
+    status_df = status_df.sort_values(["part_key", "priority"], ascending=[True, False])
+    return (
+        status_df.groupby("part_key", as_index=False)
+        .agg(
+            part_no=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
+            description_status=("description_status", first_non_empty),
+            situacion_archivo=("situacion_archivo", first_non_empty),
+            ubicacion=("ubicacion", join_unique_text),
+            locacion_nodum=("locacion_nodum", join_unique_text),
+            comentarios_archivo=("comentarios_archivo", join_unique_text),
+            fuente_status=("fuente_status", join_unique_text),
+        )
+    )
+
+
+def build_mudanza_dataset(
+    inventory_frames: list[pd.DataFrame],
+    analysis_df: pd.DataFrame,
+    status_df: Optional[pd.DataFrame] = None,
+    saved_decisions_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    valid_inventories = [frame.copy() for frame in inventory_frames if isinstance(frame, pd.DataFrame) and not frame.empty]
+    if not valid_inventories:
+        return empty_mudanza_items_df()
+
+    inventory_df = pd.concat(valid_inventories, ignore_index=True)
+    inventory_df = inventory_df[(inventory_df["part_key"].astype(str).str.strip() != "") & (inventory_df["stock"] > 0)].copy()
+    if inventory_df.empty:
+        return empty_mudanza_items_df()
+
+    inventory_df = (
+        inventory_df.groupby(["deposit_code", "deposit_name", "part_key"], as_index=False)
+        .agg(
+            part_no=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
+            description=("description", first_non_empty),
+            stock=("stock", "sum"),
+            ubicacion=("ubicacion", join_unique_text),
+            locacion_nodum=("locacion_nodum", join_unique_text),
+        )
+    )
+
+    analysis_lookup = ensure_part_identity_columns(
+        analysis_df[["part_no", "description", "abc", "status"]].copy(),
+        allow_mazda_compact=True,
+    )
+    analysis_lookup = (
+        analysis_lookup.groupby("part_key", as_index=False)
+        .agg(
+            part_no_analysis=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
+            description_analysis=("description", first_non_empty),
+            frecuencia_abc=("abc", first_non_empty),
+            status_analysis=("status", first_non_empty),
+        )
+    )
+
+    result = inventory_df.merge(analysis_lookup, on="part_key", how="left")
+    if status_df is not None and not status_df.empty:
+        result = result.merge(status_df, on="part_key", how="left", suffixes=("", "_status"))
+    else:
+        result["part_no_status"] = ""
+        result["description_status"] = ""
+        result["situacion_archivo"] = ""
+        result["ubicacion_status"] = ""
+        result["locacion_nodum_status"] = ""
+
+    if saved_decisions_df is not None and not saved_decisions_df.empty:
+        saved_choices = saved_decisions_df.copy()
+        saved_choices["deposit_code"] = saved_choices["deposit_code"].astype(str).str.strip()
+        saved_choices["part_key"] = saved_choices["part_key"].astype(str).str.strip()
+        result = result.merge(
+            saved_choices[["deposit_code", "part_key", "destino_mudanza"]],
+            on=["deposit_code", "part_key"],
+            how="left",
+            suffixes=("", "_saved"),
+        )
+        if "destino_mudanza_saved" in result.columns:
+            result["destino_mudanza"] = result["destino_mudanza_saved"]
+            result = result.drop(columns=["destino_mudanza_saved"])
+    else:
+        result["destino_mudanza"] = ""
+
+    result["part_no"] = result["part_no"].mask(result["part_no"].astype(str).str.strip() == "", result["part_no_analysis"])
+    if "part_no_status" in result.columns:
+        result["part_no"] = result["part_no"].mask(result["part_no"].astype(str).str.strip() == "", result["part_no_status"])
+
+    result["description"] = result["description"].mask(
+        result["description"].astype(str).str.strip() == "",
+        result["description_analysis"],
+    )
+    if "description_status" in result.columns:
+        result["description"] = result["description"].mask(
+            result["description"].astype(str).str.strip() == "",
+            result["description_status"],
+        )
+
+    if "ubicacion_status" in result.columns:
+        result["ubicacion"] = result["ubicacion"].mask(result["ubicacion"].astype(str).str.strip() == "", result["ubicacion_status"])
+    if "locacion_nodum_status" in result.columns:
+        result["locacion_nodum"] = result["locacion_nodum"].mask(
+            result["locacion_nodum"].astype(str).str.strip() == "",
+            result["locacion_nodum_status"],
+        )
+
+    result["frecuencia_abc"] = result["frecuencia_abc"].fillna("").astype(str).str.strip().replace("", "NO ESTA")
+    result["situacion_archivo"] = result.get("situacion_archivo", "").fillna("").astype(str).str.strip()
+    result["situacion_articulo"] = result["situacion_archivo"]
+    abc_mask = result["situacion_articulo"].eq("") & result["frecuencia_abc"].isin(["A", "B", "C"])
+    result.loc[abc_mask, "situacion_articulo"] = result.loc[abc_mask, "frecuencia_abc"]
+    result.loc[result["situacion_articulo"].eq(""), "situacion_articulo"] = "NO ESTA"
+    result["destino_mudanza"] = result["destino_mudanza"].fillna("").astype(str).str.strip()
+    result.loc[~result["destino_mudanza"].isin(MUDANZA_DESTINATIONS), "destino_mudanza"] = "Pendiente"
+
+    result["stock"] = pd.to_numeric(result["stock"], errors="coerce").fillna(0)
+    result = result[result["stock"] > 0].copy()
+    result = result.sort_values(
+        ["deposit_code", "situacion_articulo", "frecuencia_abc", "stock", "part_no"],
+        ascending=[True, True, True, False, True],
+    ).reset_index(drop=True)
+    return result[empty_mudanza_items_df().columns]
 
 
 def load_backorder(uploaded_file) -> pd.DataFrame:
@@ -1237,6 +1624,45 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mudanza_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                empresa TEXT NOT NULL,
+                analysis_month TEXT NOT NULL,
+                analysis_date TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                inventory_d012_filename TEXT,
+                inventory_d122_filename TEXT,
+                status_filename TEXT,
+                total_items INTEGER DEFAULT 0,
+                total_stock REAL DEFAULT 0,
+                source_hash TEXT NOT NULL UNIQUE,
+                notes TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mudanza_run_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                deposit_code TEXT,
+                deposit_name TEXT,
+                part_key TEXT,
+                part_no TEXT NOT NULL,
+                description TEXT,
+                stock REAL DEFAULT 0,
+                ubicacion TEXT,
+                locacion_nodum TEXT,
+                frecuencia_abc TEXT,
+                situacion_archivo TEXT,
+                situacion_articulo TEXT,
+                destino_mudanza TEXT,
+                FOREIGN KEY (run_id) REFERENCES mudanza_runs(id) ON DELETE CASCADE
+            )
+            """
+        )
 
         ensure_column(conn, "factory_order_batches", "order_code", "TEXT")
         ensure_column(conn, "factory_order_batches", "order_file_hash", "TEXT")
@@ -1264,6 +1690,12 @@ def init_db():
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_order_batches_file_hash ON factory_order_batches(order_file_hash)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mudanza_runs_company_date ON mudanza_runs(empresa, analysis_date, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mudanza_items_run_part ON mudanza_run_items(run_id, deposit_code, part_key)"
         )
 
         migrate_legacy_data(conn)
@@ -2021,6 +2453,151 @@ def save_analysis_run(
         }
 
 
+def persist_mudanza_items(conn, run_id: int, items_df: pd.DataFrame):
+    export_df = empty_mudanza_items_df()
+    if not items_df.empty:
+        export_df = items_df[empty_mudanza_items_df().columns].copy()
+
+    rows = []
+    for _, row in export_df.iterrows():
+        rows.append(
+            (
+                run_id,
+                safe_text(row["deposit_code"]),
+                safe_text(row["deposit_name"]),
+                safe_text(row["part_key"]),
+                safe_text(row["part_no"]),
+                safe_text(row["description"]),
+                float(row["stock"] or 0),
+                safe_text(row["ubicacion"]),
+                safe_text(row["locacion_nodum"]),
+                safe_text(row["frecuencia_abc"]),
+                safe_text(row["situacion_archivo"]),
+                safe_text(row["situacion_articulo"]),
+                safe_text(row["destino_mudanza"]),
+            )
+        )
+
+    conn.execute("DELETE FROM mudanza_run_items WHERE run_id = ?", (run_id,))
+    if rows:
+        conn.executemany(
+            """
+            INSERT INTO mudanza_run_items (
+                run_id,
+                deposit_code,
+                deposit_name,
+                part_key,
+                part_no,
+                description,
+                stock,
+                ubicacion,
+                locacion_nodum,
+                frecuencia_abc,
+                situacion_archivo,
+                situacion_articulo,
+                destino_mudanza
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+
+def build_mudanza_source_hash(
+    empresa: str,
+    analysis_month: str,
+    inventory_d012_file,
+    inventory_d122_file,
+    status_file,
+    items_df: pd.DataFrame,
+) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(f"{empresa}|{analysis_month}".encode("utf-8"))
+    for uploaded in [inventory_d012_file, inventory_d122_file, status_file]:
+        if uploaded is None:
+            hasher.update(b"SIN_ARCHIVO")
+            continue
+        hasher.update(uploaded.name.encode("utf-8"))
+        hasher.update(uploaded.getvalue())
+
+    payload_df = empty_mudanza_items_df()
+    if not items_df.empty:
+        payload_df = items_df[empty_mudanza_items_df().columns].copy()
+        payload_df = payload_df.sort_values(["deposit_code", "part_key", "part_no"]).reset_index(drop=True)
+    hasher.update(payload_df.to_json(orient="records", force_ascii=False).encode("utf-8"))
+    return hasher.hexdigest()
+
+
+def save_mudanza_run(
+    empresa: str,
+    analysis_date: date,
+    inventory_d012_file,
+    inventory_d122_file,
+    status_file,
+    items_df: pd.DataFrame,
+    notes: str,
+):
+    analysis_month = get_analysis_month(analysis_date)
+    created_at = datetime.now().replace(microsecond=0).isoformat()
+    source_hash = build_mudanza_source_hash(
+        empresa=empresa,
+        analysis_month=analysis_month,
+        inventory_d012_file=inventory_d012_file,
+        inventory_d122_file=inventory_d122_file,
+        status_file=status_file,
+        items_df=items_df,
+    )
+
+    with get_connection() as conn:
+        existing = conn.execute("SELECT id FROM mudanza_runs WHERE source_hash = ?", (source_hash,)).fetchone()
+        if existing:
+            return {
+                "status": "duplicate",
+                "run_id": int(existing["id"]),
+                "message": "La decision de mudanza ya estaba guardada.",
+            }
+
+        cursor = conn.execute(
+            """
+            INSERT INTO mudanza_runs (
+                empresa,
+                analysis_month,
+                analysis_date,
+                created_at,
+                inventory_d012_filename,
+                inventory_d122_filename,
+                status_filename,
+                total_items,
+                total_stock,
+                source_hash,
+                notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                empresa,
+                analysis_month,
+                analysis_date.isoformat(),
+                created_at,
+                inventory_d012_file.name if inventory_d012_file is not None else "",
+                inventory_d122_file.name if inventory_d122_file is not None else "",
+                status_file.name if status_file is not None else "",
+                int(len(items_df)),
+                float(pd.to_numeric(items_df.get("stock", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
+                source_hash,
+                notes,
+            ),
+        )
+        run_id = int(cursor.lastrowid)
+        persist_mudanza_items(conn, run_id, items_df)
+        conn.commit()
+    return {
+        "status": "saved",
+        "run_id": run_id,
+        "message": "Mudanza guardada correctamente.",
+    }
+
+
 def load_recent_runs(empresa: str, limit: int = 12) -> pd.DataFrame:
     with get_connection() as conn:
         df = pd.read_sql_query(
@@ -2045,6 +2622,90 @@ def load_recent_runs(empresa: str, limit: int = 12) -> pd.DataFrame:
             """,
             conn,
             params=(empresa, limit),
+        )
+    return df
+
+
+def load_recent_mudanza_runs(empresa: str, limit: int = 12) -> pd.DataFrame:
+    with get_connection() as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                r.id AS mudanza_id,
+                r.analysis_month AS mes_analisis,
+                r.created_at AS fecha_carga,
+                r.inventory_d012_filename AS inventario_d012,
+                r.inventory_d122_filename AS inventario_d122,
+                r.status_filename AS archivo_situacion,
+                r.total_items AS items,
+                ROUND(r.total_stock, 2) AS stock_total,
+                ROUND(COALESCE(SUM(CASE WHEN i.destino_mudanza = 'Polo Logistico' THEN i.stock ELSE 0 END), 0), 2) AS stock_polo,
+                ROUND(COALESCE(SUM(CASE WHEN i.destino_mudanza = 'Darkinel' THEN i.stock ELSE 0 END), 0), 2) AS stock_darkinel,
+                ROUND(COALESCE(SUM(CASE WHEN i.destino_mudanza = 'Pendiente' THEN i.stock ELSE 0 END), 0), 2) AS stock_pendiente
+            FROM mudanza_runs r
+            LEFT JOIN mudanza_run_items i ON i.run_id = r.id
+            WHERE r.empresa = ?
+            GROUP BY r.id, r.analysis_month, r.created_at, r.inventory_d012_filename, r.inventory_d122_filename, r.status_filename, r.total_items, r.total_stock
+            ORDER BY r.analysis_date DESC, r.created_at DESC
+            LIMIT ?
+            """,
+            conn,
+            params=(empresa, limit),
+        )
+    return df
+
+
+def load_mudanza_items(run_id: int) -> pd.DataFrame:
+    with get_connection() as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                deposit_code,
+                deposit_name,
+                part_key,
+                part_no,
+                description,
+                stock,
+                ubicacion,
+                locacion_nodum,
+                frecuencia_abc,
+                situacion_archivo,
+                situacion_articulo,
+                destino_mudanza
+            FROM mudanza_run_items
+            WHERE run_id = ?
+            ORDER BY deposit_code, destino_mudanza, situacion_articulo, stock DESC, part_no
+            """,
+            conn,
+            params=(run_id,),
+        )
+    if df.empty:
+        return empty_mudanza_items_df()
+    return df
+
+
+def load_latest_mudanza_decisions(empresa: str) -> pd.DataFrame:
+    with get_connection() as conn:
+        latest = conn.execute(
+            """
+            SELECT id
+            FROM mudanza_runs
+            WHERE empresa = ?
+            ORDER BY analysis_date DESC, created_at DESC
+            LIMIT 1
+            """,
+            (empresa,),
+        ).fetchone()
+        if latest is None:
+            return pd.DataFrame(columns=["deposit_code", "part_key", "destino_mudanza"])
+        df = pd.read_sql_query(
+            """
+            SELECT deposit_code, part_key, destino_mudanza
+            FROM mudanza_run_items
+            WHERE run_id = ?
+            """,
+            conn,
+            params=(int(latest["id"]),),
         )
     return df
 
@@ -2484,6 +3145,278 @@ def render_save_feedback():
         st.error(feedback.get("message", "No se pudo guardar la corrida."))
 
 
+def render_mudanza_feedback():
+    feedback = st.session_state.pop("mudanza_feedback", None)
+    if not feedback:
+        return
+
+    if feedback["status"] == "saved":
+        st.success(f"Mudanza #{feedback['run_id']} guardada.")
+    elif feedback["status"] == "duplicate":
+        st.warning(f"La decision de mudanza ya existia en la base con el id #{feedback['run_id']}.")
+    else:
+        st.error(feedback.get("message", "No se pudo guardar la mudanza."))
+
+
+def build_mudanza_export_df(df: pd.DataFrame) -> pd.DataFrame:
+    export_cols = [
+        "deposit_name",
+        "part_no",
+        "description",
+        "stock",
+        "ubicacion",
+        "locacion_nodum",
+        "frecuencia_abc",
+        "situacion_articulo",
+        "destino_mudanza",
+    ]
+    export_df = empty_mudanza_items_df()
+    if not df.empty:
+        export_df = df.copy()
+    export_df = export_df.reindex(columns=export_cols, fill_value="")
+    return export_df.rename(
+        columns={
+            "deposit_name": "deposito",
+            "part_no": "codigo",
+            "description": "nombre",
+            "stock": "cantidad",
+            "locacion_nodum": "locacion_nodum",
+            "frecuencia_abc": "frecuencia_abc",
+            "situacion_articulo": "situacion",
+            "destino_mudanza": "destino",
+        }
+    )
+
+
+def render_mudanza_tab(
+    empresa: str,
+    analysis_date: date,
+    analysis_month: str,
+    final_df: pd.DataFrame,
+    default_inventory_file,
+    default_note: str = "",
+):
+    render_mudanza_feedback()
+    st.subheader("Mudanza")
+    st.caption(
+        "Analiza stock de D012 (Darkinel Central) y D122 (Deposito Panol), cruza ABC y situacion del articulo, "
+        "y te deja decidir si cada pieza va al Polo Logistico o se queda en Darkinel."
+    )
+
+    source_col_1, source_col_2 = st.columns(2)
+    inventory_d012_upload = source_col_1.file_uploader(
+        "Inventario D012 / Darkinel Central",
+        type=["xls", "xlsx"],
+        key=f"mudanza_inventory_d012_{analysis_month}",
+    )
+    inventory_d122_upload = source_col_2.file_uploader(
+        "Inventario D122 / Deposito Panol (opcional)",
+        type=["xls", "xlsx"],
+        key=f"mudanza_inventory_d122_{analysis_month}",
+    )
+    status_upload = st.file_uploader(
+        "Archivo situacion articulos (Stock MUERTO_ARRIETA / Audistock / Muerto / Arrieta)",
+        type=["xlsx"],
+        key=f"mudanza_status_{analysis_month}",
+    )
+
+    inventory_d012_file = resolve_source_file(inventory_d012_upload, default_inventory_file)
+    inventory_d122_file = inventory_d122_upload
+    status_file = status_upload
+
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "fuente": "Inventario D012",
+                    "archivo": inventory_d012_file.name if inventory_d012_file is not None else "No cargado",
+                },
+                {
+                    "fuente": "Inventario D122",
+                    "archivo": inventory_d122_file.name if inventory_d122_file is not None else "No cargado",
+                },
+                {
+                    "fuente": "Situacion articulos",
+                    "archivo": status_file.name if status_file is not None else "No cargado",
+                },
+            ]
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    inventory_frames = []
+    try:
+        if inventory_d012_file is not None:
+            inventory_frames.append(load_mudanza_inventory(inventory_d012_file, fallback_deposit_code="D012"))
+        if inventory_d122_file is not None:
+            inventory_frames.append(load_mudanza_inventory(inventory_d122_file, fallback_deposit_code="D122"))
+        status_df = load_mudanza_status(status_file) if status_file is not None else pd.DataFrame()
+        previous_decisions_df = load_latest_mudanza_decisions(empresa)
+        mudanza_df = build_mudanza_dataset(
+            inventory_frames=inventory_frames,
+            analysis_df=final_df,
+            status_df=status_df,
+            saved_decisions_df=previous_decisions_df,
+        )
+    except Exception as exc:
+        st.error(f"No se pudo preparar la pestana de mudanza: {exc}")
+        return
+
+    if mudanza_df.empty:
+        st.info(
+            "Carga al menos un inventario D012 o D122 con stock positivo para trabajar la mudanza. "
+            "El archivo de situacion es opcional, pero recomendado."
+        )
+    else:
+        metric_1, metric_2, metric_3, metric_4 = st.columns(4)
+        metric_1.metric("Articulos en mudanza", f"{len(mudanza_df):,}")
+        metric_2.metric("Unidades totales", f"{int(mudanza_df['stock'].sum()):,}")
+        metric_3.metric("Con ABC", f"{int(mudanza_df['frecuencia_abc'].isin(['A', 'B', 'C']).sum()):,}")
+        metric_4.metric(
+            "Marcados en archivo",
+            f"{int(mudanza_df['situacion_archivo'].astype(str).str.strip().ne('').sum()):,}",
+        )
+
+        summary_col_1, summary_col_2 = st.columns(2)
+        summary_col_1.caption("Resumen por deposito")
+        summary_col_1.dataframe(
+            mudanza_df.groupby(["deposit_code", "deposit_name"], as_index=False)
+            .agg(articulos=("part_no", "count"), unidades=("stock", "sum"))
+            .sort_values(["deposit_code", "deposit_name"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+        summary_col_2.caption("Resumen por situacion")
+        summary_col_2.dataframe(
+            mudanza_df.groupby("situacion_articulo", as_index=False)
+            .agg(articulos=("part_no", "count"), unidades=("stock", "sum"))
+            .sort_values(["situacion_articulo"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption("Define el destino para cada articulo. Si ya habia una decision guardada, se precarga automaticamente.")
+        editor_source_df = mudanza_df.reset_index(drop=True).copy()
+        editor_display_df = pd.DataFrame(
+            {
+                "Deposito": editor_source_df["deposit_name"],
+                "Codigo": editor_source_df["part_no"],
+                "Nombre": editor_source_df["description"],
+                "Cantidad": editor_source_df["stock"],
+                "Ubicacion": editor_source_df["ubicacion"],
+                "Frecuencia": editor_source_df["frecuencia_abc"],
+                "Situacion": editor_source_df["situacion_articulo"],
+                "Destino": editor_source_df["destino_mudanza"],
+            }
+        )
+        edited_display_df = st.data_editor(
+            editor_display_df,
+            hide_index=True,
+            use_container_width=True,
+            height=460,
+            key=f"mudanza_editor_{analysis_month}",
+            column_config={
+                "Cantidad": st.column_config.NumberColumn("Cantidad", format="%.0f", disabled=True),
+                "Destino": st.column_config.SelectboxColumn("Destino", options=MUDANZA_DESTINATIONS, required=True),
+            },
+            disabled=["Deposito", "Codigo", "Nombre", "Cantidad", "Ubicacion", "Frecuencia", "Situacion"],
+        )
+
+        edited_mudanza_df = editor_source_df.copy()
+        edited_mudanza_df["destino_mudanza"] = edited_display_df["Destino"].fillna("Pendiente").astype(str).str.strip()
+        edited_mudanza_df.loc[
+            ~edited_mudanza_df["destino_mudanza"].isin(MUDANZA_DESTINATIONS), "destino_mudanza"
+        ] = "Pendiente"
+
+        pending_df = edited_mudanza_df[edited_mudanza_df["destino_mudanza"] == "Pendiente"].copy()
+        polo_df = edited_mudanza_df[edited_mudanza_df["destino_mudanza"] == "Polo Logistico"].copy()
+        darkinel_df = edited_mudanza_df[edited_mudanza_df["destino_mudanza"] == "Darkinel"].copy()
+
+        action_col_1, action_col_2, action_col_3 = st.columns([1, 1, 2])
+        action_col_1.metric("Unidades a Polo", f"{int(polo_df['stock'].sum()):,}")
+        action_col_2.metric("Unidades en Darkinel", f"{int(darkinel_df['stock'].sum()):,}")
+        if action_col_3.button("Guardar decision de mudanza", type="primary", key=f"save_mudanza_{analysis_month}"):
+            try:
+                result = save_mudanza_run(
+                    empresa=empresa,
+                    analysis_date=analysis_date,
+                    inventory_d012_file=inventory_d012_file,
+                    inventory_d122_file=inventory_d122_file,
+                    status_file=status_file,
+                    items_df=edited_mudanza_df,
+                    notes=default_note,
+                )
+                st.session_state["mudanza_feedback"] = result
+                st.rerun()
+            except Exception as exc:
+                st.session_state["mudanza_feedback"] = {
+                    "status": "error",
+                    "message": f"No se pudo guardar la mudanza: {exc}",
+                }
+                st.rerun()
+
+        list_col_1, list_col_2 = st.columns(2)
+        export_polo_df = build_mudanza_export_df(polo_df)
+        export_darkinel_df = build_mudanza_export_df(darkinel_df)
+
+        list_col_1.subheader("A Polo Logistico")
+        if export_polo_df.empty:
+            list_col_1.info("Todavia no hay articulos asignados al Polo Logistico.")
+        else:
+            list_col_1.dataframe(export_polo_df, use_container_width=True, height=320, hide_index=True)
+            list_col_1.download_button(
+                "Descargar Polo Logistico",
+                data=dataframe_to_excel_bytes(export_polo_df, sheet_name="Polo Logistico"),
+                file_name=f"mudanza_polo_logistico_{analysis_month}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"download_mudanza_polo_{analysis_month}",
+            )
+
+        list_col_2.subheader("Se queda en Darkinel")
+        if export_darkinel_df.empty:
+            list_col_2.info("Todavia no hay articulos marcados para quedarse en Darkinel.")
+        else:
+            list_col_2.dataframe(export_darkinel_df, use_container_width=True, height=320, hide_index=True)
+            list_col_2.download_button(
+                "Descargar Darkinel",
+                data=dataframe_to_excel_bytes(export_darkinel_df, sheet_name="Darkinel"),
+                file_name=f"mudanza_darkinel_{analysis_month}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"download_mudanza_darkinel_{analysis_month}",
+            )
+
+        st.subheader("Pendientes de definir")
+        if pending_df.empty:
+            st.success("Todos los articulos del listado ya tienen destino asignado.")
+        else:
+            st.dataframe(build_mudanza_export_df(pending_df), use_container_width=True, height=240, hide_index=True)
+
+    st.subheader("Historial guardado de mudanza")
+    mudanza_history_df = load_recent_mudanza_runs(empresa)
+    if mudanza_history_df.empty:
+        st.info("Todavia no hay decisiones de mudanza guardadas para esta empresa.")
+        return
+
+    st.dataframe(mudanza_history_df, use_container_width=True, height=260, hide_index=True)
+    history_labels = [
+        f"#{int(row['mudanza_id'])} - {row['mes_analisis']} - {row['fecha_carga']}"
+        for _, row in mudanza_history_df.iterrows()
+    ]
+    selected_history_label = st.selectbox(
+        "Ver snapshot guardado de mudanza",
+        history_labels,
+        key=f"mudanza_history_selector_{analysis_month}",
+    )
+    selected_history_index = history_labels.index(selected_history_label)
+    selected_history_id = int(mudanza_history_df.iloc[selected_history_index]["mudanza_id"])
+    saved_mudanza_df = load_mudanza_items(selected_history_id)
+    if saved_mudanza_df.empty:
+        st.info("La snapshot seleccionada no tiene articulos guardados.")
+    else:
+        st.dataframe(build_mudanza_export_df(saved_mudanza_df), use_container_width=True, height=320, hide_index=True)
+
+
 def render_saved_factory_orders(empresa: str):
     st.subheader("Pedidos a fabrica guardados en base")
     batches_df = load_recent_order_batches(empresa)
@@ -2644,6 +3577,380 @@ def render_final_order_upload_manager(
             st.rerun()
         except Exception as exc:
             st.error(f"No se pudo enviar el pedido a fabrica: {exc}")
+
+
+def render_pedido_tab(
+    empresa_activa: str,
+    analysis_month: str,
+    final_df: pd.DataFrame,
+    baseline,
+    code_unification_report: pd.DataFrame,
+    top_n: int,
+    save_note: str,
+):
+    baseline_text = "Sin corrida historica previa guardada."
+    if baseline is not None:
+        baseline_text = (
+            f"Comparando contra la corrida #{baseline['id']} del {baseline['analysis_month']} "
+            f"guardada el {pd.to_datetime(baseline['created_at']).strftime('%Y-%m-%d %H:%M')}."
+        )
+    st.caption(baseline_text)
+
+    brand_options = ["Todos"] + sorted(final_df["brand"].dropna().unique().tolist())
+    status_options = ["Todos"] + sorted(final_df["status"].dropna().unique().tolist())
+    abc_values = sorted(
+        final_df["abc"].dropna().unique().tolist(),
+        key=lambda value: ABC_SORT_ORDER.get(value, 99),
+    )
+    abc_options = ["Todos"] + abc_values
+
+    filter_col_1, filter_col_2, filter_col_3, filter_col_4 = st.columns(4)
+    selected_brand = filter_col_1.selectbox("Marca", brand_options, key=f"pedido_brand_{analysis_month}")
+    selected_status = filter_col_2.selectbox("Estado", status_options, key=f"pedido_status_{analysis_month}")
+    selected_abc = filter_col_3.selectbox("ABC", abc_options, key=f"pedido_abc_{analysis_month}")
+    search_text = filter_col_4.text_input("Buscar codigo o descripcion", key=f"pedido_search_{analysis_month}")
+
+    view = final_df.copy()
+    if selected_brand != "Todos":
+        view = view[view["brand"] == selected_brand]
+    if selected_status != "Todos":
+        view = view[view["status"] == selected_status]
+    if selected_abc != "Todos":
+        view = view[view["abc"] == selected_abc]
+    if search_text:
+        term = search_text.strip().upper()
+        term_key = normalize_part_key(term, allow_mazda_compact=True)
+        term_display = normalize_part_display(term, allow_mazda_compact=True)
+        view = view[
+            view["part_no"].astype(str).str.upper().str.contains(term, na=False, regex=False)
+            | view["part_no"].astype(str).str.upper().str.contains(term_display, na=False, regex=False)
+            | view["part_key"].astype(str).str.upper().str.contains(term_key, na=False, regex=False)
+            | view["description"].astype(str).str.upper().str.contains(term, na=False, regex=False)
+        ]
+
+    stock_dead_units = int(view.loc[view["stock_muerto"], "stock"].sum())
+
+    metric_top_1, metric_top_2, metric_top_3, metric_top_4 = st.columns(4)
+    metric_top_1.metric("Articulos", f"{len(view):,}")
+    metric_top_2.metric("Art. stock muerto", f"{int(view['stock_muerto'].sum()):,}")
+    metric_top_3.metric("Unid. stock muerto", f"{stock_dead_units:,}")
+    metric_top_4.metric("Art. ofertas", f"{int(view['oferta_sugerida'].sum()):,}")
+
+    metric_bottom_1, metric_bottom_2, metric_bottom_3, metric_bottom_4 = st.columns(4)
+    metric_bottom_1.metric("Unid. pedido archivo", f"{int(view['monthly_order_qty'].sum()):,}")
+    metric_bottom_2.metric("Art. sugeridos compra", f"{int((view['suggested_order_qty'] > 0).sum()):,}")
+    metric_bottom_3.metric("Unid. sugeridas compra", f"{int(view['suggested_order_qty'].sum()):,}")
+    metric_bottom_4.metric("Unid. abierto DB", f"{int(view['open_order_qty_db'].sum()):,}")
+
+    st.subheader("Detalle compra sugerida")
+    suggested_detail = view[view["suggested_order_qty"] > 0].copy()
+    if suggested_detail.empty:
+        st.info("No hay articulos con compra sugerida para los filtros actuales.")
+    else:
+        suggested_detail = suggested_detail.sort_values(
+            ["smart_score", "suggested_order_qty", "sales_units"],
+            ascending=[False, False, False],
+        )
+        suggested_cols = [
+            "part_no",
+            "description",
+            "brand",
+            "abc",
+            "status",
+            "sales_units",
+            "stock",
+            "backorder_qty",
+            "monthly_order_qty",
+            "open_order_qty_db",
+            "available_plus_pipeline",
+            "target_stock_qty",
+            "suggested_order_qty",
+        ]
+        suggested_view = suggested_detail[suggested_cols].rename(
+            columns={
+                "part_no": "codigo",
+                "description": "descripcion",
+                "brand": "marca",
+                "status": "estado",
+                "sales_units": "ventas_3_anios",
+                "backorder_qty": "backorder",
+                "monthly_order_qty": "pedido_archivo",
+                "open_order_qty_db": "abierto_db",
+                "available_plus_pipeline": "stock_mas_pedidos",
+                "target_stock_qty": "stock_objetivo",
+                "suggested_order_qty": "cantidad_sugerida",
+            }
+        )
+        st.dataframe(suggested_view, use_container_width=True, height=360)
+        st.download_button(
+            "Descargar detalle compra sugerida",
+            data=dataframe_to_excel_bytes(suggested_view),
+            file_name=f"detalle_compra_sugerida_{analysis_month}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"download_suggested_detail_{analysis_month}",
+        )
+
+    st.subheader("Resumen por marca")
+    summary_brand = (
+        view.groupby("brand", as_index=False)
+        .agg(
+            items=("part_no", "count"),
+            ventas_3y=("sales_units", "sum"),
+            stock=("stock", "sum"),
+            backorder=("backorder_qty", "sum"),
+            pedido_archivo=("monthly_order_qty", "sum"),
+            abierto_db=("open_order_qty_db", "sum"),
+            compra_inteligente=("intelligent_buy_qty", "sum"),
+        )
+        .sort_values("ventas_3y", ascending=False)
+    )
+    st.dataframe(summary_brand, use_container_width=True)
+
+    st.subheader("Resumen ABC / Muerto")
+    summary_abc = (
+        view.groupby("abc", as_index=False)
+        .agg(
+            items=("part_no", "count"),
+            ventas_base=("sales_units", "sum"),
+            stock=("stock", "sum"),
+            pedido_archivo=("monthly_order_qty", "sum"),
+            abierto_db=("open_order_qty_db", "sum"),
+            sugerido=("suggested_order_qty", "sum"),
+        )
+    )
+    summary_abc["orden"] = summary_abc["abc"].map(ABC_SORT_ORDER).fillna(99)
+    summary_abc = summary_abc.sort_values("orden").drop(columns=["orden"])
+    st.dataframe(summary_abc, use_container_width=True)
+
+    st.subheader("Top productos por ventas")
+    top_sales = view.sort_values("sales_units", ascending=False).head(top_n)
+    st.dataframe(
+        top_sales[
+            [
+                "empresa",
+                "part_no",
+                "description",
+                "brand",
+                "sales_units",
+                "stock",
+                "backorder_qty",
+                "monthly_order_qty",
+                "open_order_qty_db",
+                "months_of_stock",
+                "abc",
+                "status",
+            ]
+        ],
+        use_container_width=True,
+    )
+
+    if not top_sales.empty:
+        plot_df = top_sales.head(15)
+        if plt is not None:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.bar(plot_df["part_no"], plot_df["sales_units"])
+            ax.set_title("Top 15 por unidades vendidas")
+            ax.set_xlabel("Codigo")
+            ax.set_ylabel("Unidades")
+            ax.tick_params(axis="x", rotation=60)
+            fig.tight_layout()
+            st.pyplot(fig)
+        else:
+            st.bar_chart(plot_df.set_index("part_no")["sales_units"])
+
+    st.subheader("Pedido inteligente")
+    pedido_inteligente = view[view["selected_for_purchase"]].copy()
+    pedido_inteligente = pedido_inteligente.sort_values(
+        ["smart_score", "intelligent_buy_cost"],
+        ascending=[False, False],
+    )
+    st.dataframe(
+        pedido_inteligente[
+            [
+                "empresa",
+                "part_no",
+                "description",
+                "brand",
+                "abc",
+                "status",
+                "stock",
+                "backorder_qty",
+                "monthly_order_qty",
+                "open_order_qty_db",
+                "suggested_order_qty",
+                "intelligent_buy_qty",
+                "estimated_unit_cost",
+                "intelligent_buy_cost",
+                "estimated_gross_profit",
+                "smart_score",
+            ]
+        ],
+        use_container_width=True,
+        height=420,
+    )
+
+    st.subheader("Pedido a solicitar a Mazda")
+    pedido_editor_df = build_editable_order_from_intelligent(pedido_inteligente)
+    pedido_mazda_df = format_order_for_factory_download(pedido_editor_df)
+    if pedido_mazda_df.empty:
+        st.info("No hay piezas Mazda seleccionadas para pedir con los parametros actuales.")
+    else:
+        st.dataframe(pedido_mazda_df, use_container_width=True, height=320)
+        st.download_button(
+            "Descargar pedido a solicitar a Mazda",
+            data=dataframe_to_excel_bytes(pedido_mazda_df),
+            file_name=f"pedido_a_solicitar_mazda_{analysis_month}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"download_order_request_{analysis_month}",
+        )
+
+    render_final_order_upload_manager(
+        empresa=empresa_activa,
+        analysis_month=analysis_month,
+        suggested_order_df=pedido_editor_df,
+        default_note=save_note,
+    )
+
+    st.subheader("Seguimiento historico de pedidos")
+    tracking_view = view[
+        (view["ordered_total_db"] > 0)
+        | (view["monthly_order_qty"] > 0)
+        | (view["backorder_qty"] > 0)
+        | (view["estimated_receipts_qty"] > 0)
+        | (view["stock_delta"] != 0)
+    ].copy()
+    tracking_view = tracking_view.sort_values(
+        ["ordered_total_db", "monthly_order_qty", "estimated_receipts_qty", "backorder_qty"],
+        ascending=[False, False, False, False],
+    )
+
+    tracking_cols = [
+        "empresa",
+        "part_no",
+        "description",
+        "brand",
+        "ordered_total_db",
+        "received_total_db",
+        "open_order_qty_db",
+        "order_batches_db",
+        "last_order_code",
+        "last_order_date",
+        "monthly_order_qty",
+        "stock_prev",
+        "stock",
+        "stock_delta",
+        "backorder_prev",
+        "backorder_qty",
+        "backorder_delta",
+        "estimated_consumption_qty",
+        "estimated_receipts_qty",
+        "tracking_status",
+    ]
+    if tracking_view.empty:
+        st.info("No hay items con seguimiento historico para mostrar en esta corrida.")
+    else:
+        st.dataframe(tracking_view[tracking_cols], use_container_width=True, height=420)
+
+    st.subheader("Stock muerto")
+    stock_muerto_df = view[view["stock_muerto"]].copy()
+    st.dataframe(
+        stock_muerto_df[["empresa", "part_no", "description", "brand", "stock", "months_of_stock"]],
+        use_container_width=True,
+        height=280,
+    )
+
+    st.subheader("Ofertas sugeridas")
+    ofertas_df = view[view["oferta_sugerida"]].copy()
+    st.dataframe(
+        ofertas_df[
+            [
+                "empresa",
+                "part_no",
+                "description",
+                "brand",
+                "stock",
+                "months_of_stock",
+                "sales_units",
+                "abc",
+            ]
+        ],
+        use_container_width=True,
+        height=280,
+    )
+
+    st.subheader("Detalle completo")
+    detail_cols = [
+        "empresa",
+        "part_no",
+        "description",
+        "brand",
+        "sales_units",
+        "sales_uyu",
+        "cost_uyu",
+        "avg_monthly_units",
+        "avg_annual_units",
+        "stock_prev",
+        "stock",
+        "stock_delta",
+        "backorder_prev",
+        "backorder_qty",
+        "backorder_delta",
+        "monthly_order_qty",
+        "ordered_total_db",
+        "received_total_db",
+        "open_order_qty_db",
+        "order_batches_db",
+        "last_order_code",
+        "last_order_date",
+        "pipeline_qty",
+        "available_plus_pipeline",
+        "months_of_stock",
+        "target_stock_qty",
+        "lead_time_need_qty",
+        "suggested_order_qty",
+        "abc",
+        "status",
+        "tracking_status",
+        "estimated_consumption_qty",
+        "estimated_receipts_qty",
+        "stock_muerto",
+        "oferta_sugerida",
+        "estimated_unit_cost",
+        "intelligent_buy_qty",
+        "intelligent_buy_cost",
+        "estimated_gross_profit",
+        "smart_score",
+    ]
+    st.dataframe(view[detail_cols], use_container_width=True, height=520)
+
+    history_export_df = load_recent_runs(empresa_activa, limit=100)
+    batches_export_df = load_recent_order_batches(empresa_activa, limit=100)
+
+    excel_bytes = to_excel_bytes(
+        {
+            "pedido_inteligente": pedido_inteligente[detail_cols],
+            "pedido_a_solicitar_mazda": pedido_mazda_df,
+            "seguimiento_pedidos": tracking_view[tracking_cols] if not tracking_view.empty else pd.DataFrame(columns=tracking_cols),
+            "stock_muerto": stock_muerto_df[detail_cols],
+            "ofertas": ofertas_df[detail_cols],
+            "resumen_marca": summary_brand,
+            "resumen_abc": summary_abc,
+            "codigos_unificados": code_unification_report,
+            "historial_corridas": history_export_df,
+            "lotes_pedidos": batches_export_df,
+            "detalle_completo": view[detail_cols],
+        }
+    )
+
+    st.download_button(
+        "Descargar analisis en Excel",
+        data=excel_bytes,
+        file_name=f"pedidos_magna_{analysis_month}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"download_full_analysis_{analysis_month}",
+    )
+
+    st.success("Analisis generado. Puedes guardarlo para que quede registrado en la base historica.")
 
 
 def main():
@@ -2826,366 +4133,26 @@ def main():
             }
             st.rerun()
 
-    baseline_text = "Sin corrida historica previa guardada."
-    if baseline is not None:
-        baseline_text = (
-            f"Comparando contra la corrida #{baseline['id']} del {baseline['analysis_month']} "
-            f"guardada el {pd.to_datetime(baseline['created_at']).strftime('%Y-%m-%d %H:%M')}."
+    pedido_tab, mudanza_tab = st.tabs(["Pedido", "Mudanza"])
+    with pedido_tab:
+        render_pedido_tab(
+            empresa_activa=empresa_activa,
+            analysis_month=analysis_month,
+            final_df=final_df,
+            baseline=baseline,
+            code_unification_report=code_unification_report,
+            top_n=top_n,
+            save_note=save_note,
         )
-    action_col_2.caption(baseline_text)
-
-    brand_options = ["Todos"] + sorted(final_df["brand"].dropna().unique().tolist())
-    status_options = ["Todos"] + sorted(final_df["status"].dropna().unique().tolist())
-    abc_values = sorted(
-        final_df["abc"].dropna().unique().tolist(),
-        key=lambda value: ABC_SORT_ORDER.get(value, 99),
-    )
-    abc_options = ["Todos"] + abc_values
-
-    filter_col_1, filter_col_2, filter_col_3, filter_col_4 = st.columns(4)
-    selected_brand = filter_col_1.selectbox("Marca", brand_options)
-    selected_status = filter_col_2.selectbox("Estado", status_options)
-    selected_abc = filter_col_3.selectbox("ABC", abc_options)
-    search_text = filter_col_4.text_input("Buscar codigo o descripcion")
-
-    view = final_df.copy()
-    if selected_brand != "Todos":
-        view = view[view["brand"] == selected_brand]
-    if selected_status != "Todos":
-        view = view[view["status"] == selected_status]
-    if selected_abc != "Todos":
-        view = view[view["abc"] == selected_abc]
-    if search_text:
-        term = search_text.strip().upper()
-        term_key = normalize_part_key(term, allow_mazda_compact=True)
-        term_display = normalize_part_display(term, allow_mazda_compact=True)
-        view = view[
-            view["part_no"].astype(str).str.upper().str.contains(term, na=False, regex=False)
-            | view["part_no"].astype(str).str.upper().str.contains(term_display, na=False, regex=False)
-            | view["part_key"].astype(str).str.upper().str.contains(term_key, na=False, regex=False)
-            | view["description"].astype(str).str.upper().str.contains(term, na=False, regex=False)
-        ]
-
-    stock_dead_units = int(view.loc[view["stock_muerto"], "stock"].sum())
-
-    metric_top_1, metric_top_2, metric_top_3, metric_top_4 = st.columns(4)
-    metric_top_1.metric("Articulos", f"{len(view):,}")
-    metric_top_2.metric("Art. stock muerto", f"{int(view['stock_muerto'].sum()):,}")
-    metric_top_3.metric("Unid. stock muerto", f"{stock_dead_units:,}")
-    metric_top_4.metric("Art. ofertas", f"{int(view['oferta_sugerida'].sum()):,}")
-
-    metric_bottom_1, metric_bottom_2, metric_bottom_3, metric_bottom_4 = st.columns(4)
-    metric_bottom_1.metric("Unid. pedido archivo", f"{int(view['monthly_order_qty'].sum()):,}")
-    metric_bottom_2.metric("Art. sugeridos compra", f"{int((view['suggested_order_qty'] > 0).sum()):,}")
-    metric_bottom_3.metric("Unid. sugeridas compra", f"{int(view['suggested_order_qty'].sum()):,}")
-    metric_bottom_4.metric("Unid. abierto DB", f"{int(view['open_order_qty_db'].sum()):,}")
-
-    st.subheader("Detalle compra sugerida")
-    suggested_detail = view[view["suggested_order_qty"] > 0].copy()
-    if suggested_detail.empty:
-        st.info("No hay articulos con compra sugerida para los filtros actuales.")
-    else:
-        suggested_detail = suggested_detail.sort_values(
-            ["smart_score", "suggested_order_qty", "sales_units"],
-            ascending=[False, False, False],
+    with mudanza_tab:
+        render_mudanza_tab(
+            empresa=empresa_activa,
+            analysis_date=analysis_date,
+            analysis_month=analysis_month,
+            final_df=final_df,
+            default_inventory_file=inventario_file,
+            default_note=save_note,
         )
-        suggested_cols = [
-            "part_no",
-            "description",
-            "brand",
-            "abc",
-            "status",
-            "sales_units",
-            "stock",
-            "backorder_qty",
-            "monthly_order_qty",
-            "open_order_qty_db",
-            "available_plus_pipeline",
-            "target_stock_qty",
-            "suggested_order_qty",
-        ]
-        suggested_view = suggested_detail[suggested_cols].rename(
-            columns={
-                "part_no": "codigo",
-                "description": "descripcion",
-                "brand": "marca",
-                "status": "estado",
-                "sales_units": "ventas_3_anios",
-                "backorder_qty": "backorder",
-                "monthly_order_qty": "pedido_archivo",
-                "open_order_qty_db": "abierto_db",
-                "available_plus_pipeline": "stock_mas_pedidos",
-                "target_stock_qty": "stock_objetivo",
-                "suggested_order_qty": "cantidad_sugerida",
-            }
-        )
-        st.dataframe(suggested_view, use_container_width=True, height=360)
-        st.download_button(
-            "Descargar detalle compra sugerida",
-            data=dataframe_to_excel_bytes(suggested_view),
-            file_name=f"detalle_compra_sugerida_{analysis_month}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-    st.subheader("Resumen por marca")
-    summary_brand = (
-        view.groupby("brand", as_index=False)
-        .agg(
-            items=("part_no", "count"),
-            ventas_3y=("sales_units", "sum"),
-            stock=("stock", "sum"),
-            backorder=("backorder_qty", "sum"),
-            pedido_archivo=("monthly_order_qty", "sum"),
-            abierto_db=("open_order_qty_db", "sum"),
-            compra_inteligente=("intelligent_buy_qty", "sum"),
-        )
-        .sort_values("ventas_3y", ascending=False)
-    )
-    st.dataframe(summary_brand, use_container_width=True)
-
-    st.subheader("Resumen ABC / Muerto")
-    summary_abc = (
-        view.groupby("abc", as_index=False)
-        .agg(
-            items=("part_no", "count"),
-            ventas_base=("sales_units", "sum"),
-            stock=("stock", "sum"),
-            pedido_archivo=("monthly_order_qty", "sum"),
-            abierto_db=("open_order_qty_db", "sum"),
-            sugerido=("suggested_order_qty", "sum"),
-        )
-    )
-    summary_abc["orden"] = summary_abc["abc"].map(ABC_SORT_ORDER).fillna(99)
-    summary_abc = summary_abc.sort_values("orden").drop(columns=["orden"])
-    st.dataframe(summary_abc, use_container_width=True)
-
-    st.subheader("Top productos por ventas")
-    top_sales = view.sort_values("sales_units", ascending=False).head(top_n)
-    st.dataframe(
-        top_sales[
-            [
-                "empresa",
-                "part_no",
-                "description",
-                "brand",
-                "sales_units",
-                "stock",
-                "backorder_qty",
-                "monthly_order_qty",
-                "open_order_qty_db",
-                "months_of_stock",
-                "abc",
-                "status",
-            ]
-        ],
-        use_container_width=True,
-    )
-
-    if not top_sales.empty:
-        plot_df = top_sales.head(15)
-        if plt is not None:
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ax.bar(plot_df["part_no"], plot_df["sales_units"])
-            ax.set_title("Top 15 por unidades vendidas")
-            ax.set_xlabel("Codigo")
-            ax.set_ylabel("Unidades")
-            ax.tick_params(axis="x", rotation=60)
-            fig.tight_layout()
-            st.pyplot(fig)
-        else:
-            st.bar_chart(plot_df.set_index("part_no")["sales_units"])
-
-    st.subheader("Pedido inteligente")
-    pedido_inteligente = view[view["selected_for_purchase"]].copy()
-    pedido_inteligente = pedido_inteligente.sort_values(
-        ["smart_score", "intelligent_buy_cost"],
-        ascending=[False, False],
-    )
-    st.dataframe(
-        pedido_inteligente[
-            [
-                "empresa",
-                "part_no",
-                "description",
-                "brand",
-                "abc",
-                "status",
-                "stock",
-                "backorder_qty",
-                "monthly_order_qty",
-                "open_order_qty_db",
-                "suggested_order_qty",
-                "intelligent_buy_qty",
-                "estimated_unit_cost",
-                "intelligent_buy_cost",
-                "estimated_gross_profit",
-                "smart_score",
-            ]
-        ],
-        use_container_width=True,
-        height=420,
-    )
-
-    st.subheader("Pedido a solicitar a Mazda")
-    pedido_editor_df = build_editable_order_from_intelligent(pedido_inteligente)
-    pedido_mazda_df = format_order_for_factory_download(pedido_editor_df)
-    if pedido_mazda_df.empty:
-        st.info("No hay piezas Mazda seleccionadas para pedir con los parametros actuales.")
-    else:
-        st.dataframe(pedido_mazda_df, use_container_width=True, height=320)
-        st.download_button(
-            "Descargar pedido a solicitar a Mazda",
-            data=dataframe_to_excel_bytes(pedido_mazda_df),
-            file_name=f"pedido_a_solicitar_mazda_{analysis_month}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-    render_final_order_upload_manager(
-        empresa=empresa_activa,
-        analysis_month=analysis_month,
-        suggested_order_df=pedido_editor_df,
-        default_note=save_note,
-    )
-
-    st.subheader("Seguimiento historico de pedidos")
-    tracking_view = view[
-        (view["ordered_total_db"] > 0)
-        | (view["monthly_order_qty"] > 0)
-        | (view["backorder_qty"] > 0)
-        | (view["estimated_receipts_qty"] > 0)
-        | (view["stock_delta"] != 0)
-    ].copy()
-    tracking_view = tracking_view.sort_values(
-        ["ordered_total_db", "monthly_order_qty", "estimated_receipts_qty", "backorder_qty"],
-        ascending=[False, False, False, False],
-    )
-
-    tracking_cols = [
-        "empresa",
-        "part_no",
-        "description",
-        "brand",
-        "ordered_total_db",
-        "received_total_db",
-        "open_order_qty_db",
-        "order_batches_db",
-        "last_order_code",
-        "last_order_date",
-        "monthly_order_qty",
-        "stock_prev",
-        "stock",
-        "stock_delta",
-        "backorder_prev",
-        "backorder_qty",
-        "backorder_delta",
-        "estimated_consumption_qty",
-        "estimated_receipts_qty",
-        "tracking_status",
-    ]
-    if tracking_view.empty:
-        st.info("No hay items con seguimiento historico para mostrar en esta corrida.")
-    else:
-        st.dataframe(tracking_view[tracking_cols], use_container_width=True, height=420)
-
-    st.subheader("Stock muerto")
-    stock_muerto_df = view[view["stock_muerto"]].copy()
-    st.dataframe(
-        stock_muerto_df[["empresa", "part_no", "description", "brand", "stock", "months_of_stock"]],
-        use_container_width=True,
-        height=280,
-    )
-
-    st.subheader("Ofertas sugeridas")
-    ofertas_df = view[view["oferta_sugerida"]].copy()
-    st.dataframe(
-        ofertas_df[
-            [
-                "empresa",
-                "part_no",
-                "description",
-                "brand",
-                "stock",
-                "months_of_stock",
-                "sales_units",
-                "abc",
-            ]
-        ],
-        use_container_width=True,
-        height=280,
-    )
-
-    st.subheader("Detalle completo")
-    detail_cols = [
-        "empresa",
-        "part_no",
-        "description",
-        "brand",
-        "sales_units",
-        "sales_uyu",
-        "cost_uyu",
-        "avg_monthly_units",
-        "avg_annual_units",
-        "stock_prev",
-        "stock",
-        "stock_delta",
-        "backorder_prev",
-        "backorder_qty",
-        "backorder_delta",
-        "monthly_order_qty",
-        "ordered_total_db",
-        "received_total_db",
-        "open_order_qty_db",
-        "order_batches_db",
-        "last_order_code",
-        "last_order_date",
-        "pipeline_qty",
-        "available_plus_pipeline",
-        "months_of_stock",
-        "target_stock_qty",
-        "lead_time_need_qty",
-        "suggested_order_qty",
-        "abc",
-        "status",
-        "tracking_status",
-        "estimated_consumption_qty",
-        "estimated_receipts_qty",
-        "stock_muerto",
-        "oferta_sugerida",
-        "estimated_unit_cost",
-        "intelligent_buy_qty",
-        "intelligent_buy_cost",
-        "estimated_gross_profit",
-        "smart_score",
-    ]
-    st.dataframe(view[detail_cols], use_container_width=True, height=520)
-
-    history_export_df = load_recent_runs(empresa_activa, limit=100)
-    batches_export_df = load_recent_order_batches(empresa_activa, limit=100)
-
-    excel_bytes = to_excel_bytes(
-        {
-            "pedido_inteligente": pedido_inteligente[detail_cols],
-            "pedido_a_solicitar_mazda": pedido_mazda_df,
-            "seguimiento_pedidos": tracking_view[tracking_cols] if not tracking_view.empty else pd.DataFrame(columns=tracking_cols),
-            "stock_muerto": stock_muerto_df[detail_cols],
-            "ofertas": ofertas_df[detail_cols],
-            "resumen_marca": summary_brand,
-            "resumen_abc": summary_abc,
-            "codigos_unificados": code_unification_report,
-            "historial_corridas": history_export_df,
-            "lotes_pedidos": batches_export_df,
-            "detalle_completo": view[detail_cols],
-        }
-    )
-
-    st.download_button(
-        "Descargar analisis en Excel",
-        data=excel_bytes,
-        file_name=f"pedidos_magna_{analysis_month}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-    st.success("Analisis generado. Puedes guardarlo para que quede registrado en la base historica.")
 
 
 if __name__ == "__main__":
