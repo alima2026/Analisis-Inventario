@@ -52,6 +52,7 @@ def _clean_part_text(value) -> str:
     if pd.isna(value):
         return ""
     text = str(value).strip().upper()
+    text = text.replace("ASTERISCO", "*")
     text = re.sub(r"\s+", "", text)
     return text
 
@@ -449,26 +450,28 @@ def join_unique_text(values, separator: str = " | ") -> str:
 
 
 def normalize_mudanza_situation(value) -> str:
+    """Normaliza la decision operativa de separacion.
+
+    Regla definida por el usuario:
+    - AUDISTOCK / ARRIETA => devolver a Arrieta.
+    - STOCK MUERTO / MUERTO => apartar para posible destruccion o sin valor.
+    """
     text = safe_text(value).upper()
     if not text:
         return ""
-    if "MUERTO" in text:
+    if "MUERTO" in text or "DESTRU" in text or "SIN VALOR" in text:
         return "MUERTO"
-    if "ARRIETA" in text:
+    if "AUDISTOCK" in text or "ARRIETA" in text:
         return "ARRIETA"
-    if "AUDISTOCK" in text:
-        return "AUDISTOCK"
     return ""
 
 
 def build_mudanza_situation_label(value) -> str:
     normalized = normalize_mudanza_situation(value)
     if normalized == "MUERTO":
-        return "APARTAR - MUERTO"
+        return "APARTAR - MUERTO / SIN VALOR"
     if normalized == "ARRIETA":
         return "DEVOLVER - ARRIETA"
-    if normalized == "AUDISTOCK":
-        return "DEVOLVER - AUDISTOCK"
     return "NO ESTA"
 
 
@@ -950,172 +953,283 @@ def load_mudanza_inventory(uploaded_file, fallback_deposit_code: str = "") -> pd
     return grouped[empty_mudanza_items_df().columns]
 
 
+def empty_mudanza_status_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "part_key",
+            "part_no",
+            "description_status",
+            "situacion_archivo",
+            "stock_status",
+            "ubicacion",
+            "locacion_nodum",
+            "comentarios_archivo",
+            "fuente_status",
+        ]
+    )
+
+
+def _normalize_column_label(value) -> str:
+    text = safe_text(value).upper()
+    replacements = {
+        "Á": "A",
+        "É": "E",
+        "Í": "I",
+        "Ó": "O",
+        "Ú": "U",
+        "Ü": "U",
+        "Ñ": "N",
+    }
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _find_column(df: pd.DataFrame, candidates: list[str]):
+    if df is None or df.empty:
+        return None
+
+    normalized_candidates = [_normalize_column_label(candidate) for candidate in candidates]
+    normalized_columns = {col: _normalize_column_label(col) for col in df.columns}
+
+    for candidate in normalized_candidates:
+        for col, normalized_col in normalized_columns.items():
+            if normalized_col == candidate:
+                return col
+
+    for candidate in normalized_candidates:
+        for col, normalized_col in normalized_columns.items():
+            if candidate and candidate in normalized_col:
+                return col
+    return None
+
+
+def _read_excel_sheet(uploaded_file, sheet_name: str, **kwargs) -> pd.DataFrame:
+    try:
+        return pd.read_excel(clone_excel_source(uploaded_file), sheet_name=sheet_name, **kwargs)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _read_sheet_by_header_markers(uploaded_file, sheet_name: str, markers: list[str], max_scan_rows: int = 12) -> pd.DataFrame:
+    raw = _read_excel_sheet(uploaded_file, sheet_name=sheet_name, header=None)
+    if raw.empty:
+        return pd.DataFrame()
+
+    normalized_markers = [_normalize_column_label(marker) for marker in markers]
+    header_idx = None
+    for idx in range(min(max_scan_rows, len(raw))):
+        row_values = [_normalize_column_label(value) for value in raw.iloc[idx].tolist()]
+        row_text = " | ".join(value for value in row_values if value)
+        if all(marker in row_text for marker in normalized_markers):
+            header_idx = idx
+            break
+
+    if header_idx is None:
+        return pd.DataFrame()
+
+    header_values = []
+    used = {}
+    for col_idx, value in enumerate(raw.iloc[header_idx].tolist()):
+        label = safe_text(value)
+        if not label:
+            label = f"Unnamed_{col_idx}"
+        if label in used:
+            used[label] += 1
+            label = f"{label}_{used[label]}"
+        else:
+            used[label] = 0
+        header_values.append(label)
+
+    out = raw.iloc[header_idx + 1 :].copy()
+    out.columns = header_values
+    out = out.dropna(how="all").reset_index(drop=True)
+    return out
+
+
 def load_mudanza_status(uploaded_file) -> pd.DataFrame:
+    """Lee el archivo Stock MUERTO_ARRIETA y arma la lista de separacion.
+
+    Importante: el archivo de situacion no es solo un cruce auxiliar. Tambien puede traer
+    articulos que se deben separar aunque no aparezcan en el inventario D012/D0122 cargado.
+    Por eso esta funcion conserva stock_status para poder agregarlos a la pantalla de Mudanza.
+    """
     frames = []
 
-    try:
-        stock_sheet = pd.read_excel(clone_excel_source(uploaded_file), sheet_name="STOCK")
-        if "part_no" in stock_sheet.columns:
-            stock_sheet = stock_sheet.copy()
-            stock_sheet = add_part_identity(stock_sheet, "part_no", allow_mazda_compact=True)
-            stock_sheet["comentario_origen"] = stock_sheet.get(
-                "Comentario", pd.Series("", index=stock_sheet.index)
-            ).fillna("")
-            stock_sheet["situacion_archivo"] = stock_sheet.get(
-                "Comentario", pd.Series("", index=stock_sheet.index)
-            ).map(normalize_mudanza_situation)
-            stock_sheet["locacion_nodum"] = stock_sheet.get(
-                "LOCACION NODUM", pd.Series("", index=stock_sheet.index)
-            ).fillna("").astype(str)
-            stock_sheet["ubicacion_actual"] = stock_sheet.get(
-                "UBICACIÓN ACTUAL INCOMPLETOS", pd.Series("", index=stock_sheet.index)
-            ).fillna("").astype(str)
-            stock_sheet["ubicacion"] = stock_sheet[["locacion_nodum", "ubicacion_actual"]].apply(first_non_empty, axis=1)
-            stock_sheet["description_status"] = ""
-            stock_sheet["fuente_status"] = "STOCK"
-            stock_sheet["comentarios_archivo"] = stock_sheet["comentario_origen"].astype(str)
-            frames.append(
-                stock_sheet[
-                    [
-                        "part_key",
-                        "part_no",
-                        "description_status",
-                        "situacion_archivo",
-                        "ubicacion",
-                        "locacion_nodum",
-                        "comentarios_archivo",
-                        "fuente_status",
-                    ]
-                ]
-            )
-    except Exception:
-        pass
+    def append_status_frame(
+        source_df: pd.DataFrame,
+        part_col,
+        source_name: str,
+        fixed_situation: str = "",
+        situation_col=None,
+        desc_col=None,
+        stock_col=None,
+        ubicacion_cols: Optional[list] = None,
+        locacion_col=None,
+        comment_col=None,
+    ):
+        if source_df is None or source_df.empty or part_col is None or part_col not in source_df.columns:
+            return
 
-    try:
-        stock_muerto_sheet = pd.read_excel(clone_excel_source(uploaded_file), sheet_name="STOCK MUERTO")
-        if "part_no" in stock_muerto_sheet.columns:
-            stock_muerto_sheet = add_part_identity(stock_muerto_sheet, "part_no", allow_mazda_compact=True)
-            stock_muerto_sheet["description_status"] = stock_muerto_sheet.get(
-                "description", pd.Series("", index=stock_muerto_sheet.index)
-            ).fillna("").astype(str)
-            stock_muerto_sheet["situacion_archivo"] = "MUERTO"
-            stock_muerto_sheet["ubicacion"] = ""
-            stock_muerto_sheet["locacion_nodum"] = ""
-            stock_muerto_sheet["comentarios_archivo"] = "STOCK MUERTO"
-            stock_muerto_sheet["fuente_status"] = "STOCK MUERTO"
-            frames.append(
-                stock_muerto_sheet[
-                    [
-                        "part_key",
-                        "part_no",
-                        "description_status",
-                        "situacion_archivo",
-                        "ubicacion",
-                        "locacion_nodum",
-                        "comentarios_archivo",
-                        "fuente_status",
-                    ]
-                ]
-            )
-    except Exception:
-        pass
+        out = source_df.copy()
+        out = out.dropna(subset=[part_col]).copy()
+        if out.empty:
+            return
 
-    try:
-        arrieta_sheet = pd.read_excel(clone_excel_source(uploaded_file), sheet_name="ARRIETA")
-        if "part_no" in arrieta_sheet.columns:
-            arrieta_sheet = add_part_identity(arrieta_sheet, "part_no", allow_mazda_compact=True)
-            arrieta_sheet["description_status"] = ""
-            arrieta_sheet["situacion_archivo"] = "ARRIETA"
-            arrieta_sheet["ubicacion"] = ""
-            arrieta_sheet["locacion_nodum"] = ""
-            arrieta_sheet["comentarios_archivo"] = "ARRIETA"
-            arrieta_sheet["fuente_status"] = "ARRIETA"
-            frames.append(
-                arrieta_sheet[
-                    [
-                        "part_key",
-                        "part_no",
-                        "description_status",
-                        "situacion_archivo",
-                        "ubicacion",
-                        "locacion_nodum",
-                        "comentarios_archivo",
-                        "fuente_status",
-                    ]
-                ]
-            )
-    except Exception:
-        pass
+        out = add_part_identity(out, part_col, allow_mazda_compact=True)
+        out = out[out["part_key"].astype(str).str.strip() != ""].copy()
+        if out.empty:
+            return
 
-    try:
-        audistock_sheet = pd.read_excel(clone_excel_source(uploaded_file), sheet_name="Audistock", header=2)
-        if "Codigo" in audistock_sheet.columns:
-            audistock_sheet = audistock_sheet.dropna(subset=["Codigo"]).copy()
-            audistock_sheet = add_part_identity(audistock_sheet, "Codigo", allow_mazda_compact=True)
-            audistock_sheet["description_status"] = audistock_sheet.get(
-                "Descripcion", pd.Series("", index=audistock_sheet.index)
-            ).fillna("").astype(str)
-            audistock_sheet["situacion_archivo"] = "AUDISTOCK"
-            audistock_sheet["ubicacion"] = ""
-            audistock_sheet["locacion_nodum"] = ""
-            audistock_sheet["comentarios_archivo"] = "AUDISTOCK"
-            audistock_sheet["fuente_status"] = "Audistock"
-            frames.append(
-                audistock_sheet[
-                    [
-                        "part_key",
-                        "part_no",
-                        "description_status",
-                        "situacion_archivo",
-                        "ubicacion",
-                        "locacion_nodum",
-                        "comentarios_archivo",
-                        "fuente_status",
-                    ]
-                ]
-            )
-    except Exception:
-        pass
+        if fixed_situation:
+            out["situacion_archivo"] = normalize_mudanza_situation(fixed_situation)
+        elif situation_col is not None and situation_col in out.columns:
+            out["situacion_archivo"] = out[situation_col].map(normalize_mudanza_situation)
+        else:
+            out["situacion_archivo"] = ""
 
-    if not frames:
-        return pd.DataFrame(
-            columns=[
-                "part_key",
-                "part_no",
-                "description_status",
-                "situacion_archivo",
-                "ubicacion",
-                "locacion_nodum",
-                "comentarios_archivo",
-                "fuente_status",
+        out = out[out["situacion_archivo"].astype(str).str.strip() != ""].copy()
+        if out.empty:
+            return
+
+        if desc_col is not None and desc_col in out.columns:
+            out["description_status"] = out[desc_col].fillna("").astype(str).str.strip()
+        else:
+            out["description_status"] = ""
+
+        if stock_col is not None and stock_col in out.columns:
+            out["stock_status"] = safe_numeric(out[stock_col])
+        else:
+            out["stock_status"] = 0.0
+
+        ubicacion_cols = ubicacion_cols or []
+        valid_ubicacion_cols = [col for col in ubicacion_cols if col is not None and col in out.columns]
+        if valid_ubicacion_cols:
+            out["ubicacion"] = out[valid_ubicacion_cols].apply(first_non_empty, axis=1)
+        else:
+            out["ubicacion"] = ""
+
+        if locacion_col is not None and locacion_col in out.columns:
+            out["locacion_nodum"] = out[locacion_col].fillna("").astype(str).str.strip()
+        else:
+            out["locacion_nodum"] = ""
+
+        if comment_col is not None and comment_col in out.columns:
+            out["comentarios_archivo"] = out[comment_col].fillna("").astype(str)
+        else:
+            out["comentarios_archivo"] = source_name
+
+        out["fuente_status"] = source_name
+        frames.append(
+            out[
+                [
+                    "part_key",
+                    "part_no",
+                    "description_status",
+                    "situacion_archivo",
+                    "stock_status",
+                    "ubicacion",
+                    "locacion_nodum",
+                    "comentarios_archivo",
+                    "fuente_status",
+                ]
             ]
         )
+
+    stock_sheet = _read_excel_sheet(uploaded_file, sheet_name="STOCK")
+    if not stock_sheet.empty:
+        part_col = _find_column(stock_sheet, ["part_no", "codigo", "cod audistock"])
+        situation_col = _find_column(stock_sheet, ["Comentario", "AUDISTOCK", "situacion"])
+        stock_col = _find_column(stock_sheet, ["stock", "cantidad", "recuento"])
+        ubicacion_col = _find_column(stock_sheet, ["UBICACION ACTUAL INCOMPLETOS", "ubicacion"])
+        locacion_col = _find_column(stock_sheet, ["LOCACION NODUM", "locacion"])
+        append_status_frame(
+            stock_sheet,
+            part_col=part_col,
+            source_name="STOCK",
+            situation_col=situation_col,
+            stock_col=stock_col,
+            ubicacion_cols=[locacion_col, ubicacion_col],
+            locacion_col=locacion_col,
+            comment_col=situation_col,
+        )
+
+    stock_muerto_sheet = _read_excel_sheet(uploaded_file, sheet_name="STOCK MUERTO")
+    if not stock_muerto_sheet.empty:
+        append_status_frame(
+            stock_muerto_sheet,
+            part_col=_find_column(stock_muerto_sheet, ["part_no", "codigo"]),
+            source_name="STOCK MUERTO",
+            fixed_situation="MUERTO",
+            desc_col=_find_column(stock_muerto_sheet, ["description", "descripcion", "nombre"]),
+            stock_col=_find_column(stock_muerto_sheet, ["stock", "cantidad"]),
+            comment_col=_find_column(stock_muerto_sheet, ["AUDISTOCK", "Comentario"]),
+        )
+
+    arrieta_sheet = _read_excel_sheet(uploaded_file, sheet_name="ARRIETA")
+    if not arrieta_sheet.empty:
+        append_status_frame(
+            arrieta_sheet,
+            part_col=_find_column(arrieta_sheet, ["part_no", "codigo"]),
+            source_name="ARRIETA",
+            fixed_situation="ARRIETA",
+            desc_col=_find_column(arrieta_sheet, ["description", "descripcion", "nombre"]),
+            stock_col=_find_column(arrieta_sheet, ["stock", "cantidad"]),
+            comment_col=_find_column(arrieta_sheet, ["AUDISTOCK", "Comentario"]),
+        )
+
+    # La hoja Audistock tiene encabezado desplazado; se detecta automaticamente.
+    audistock_sheet = _read_sheet_by_header_markers(uploaded_file, "Audistock", ["Codigo", "Descripcion"])
+    if not audistock_sheet.empty:
+        append_status_frame(
+            audistock_sheet,
+            part_col=_find_column(audistock_sheet, ["Codigo"]),
+            source_name="AUDISTOCK",
+            fixed_situation="ARRIETA",
+            desc_col=_find_column(audistock_sheet, ["Descripcion"]),
+            stock_col=_find_column(audistock_sheet, ["Conteo Audistock", "Cantidad recontada", "Stock actual NODUM"]),
+            comment_col=_find_column(audistock_sheet, ["AUDISTOCK"]),
+        )
+
+    # La hoja Control tambien corresponde a devolucion a Arrieta.
+    control_sheet = _read_sheet_by_header_markers(uploaded_file, "Control", ["Cod Audistock", "Nom art"])
+    if not control_sheet.empty:
+        append_status_frame(
+            control_sheet,
+            part_col=_find_column(control_sheet, ["Cod Audistock", "Cod etiqueta"]),
+            source_name="CONTROL ARRIETA",
+            fixed_situation="ARRIETA",
+            desc_col=_find_column(control_sheet, ["Nom art", "Descripcion"]),
+            stock_col=_find_column(control_sheet, ["Recuento", "Audistock", "Cantidad"]),
+            comment_col=_find_column(control_sheet, ["COMENTARIO"]),
+        )
+
+    if not frames:
+        return empty_mudanza_status_df()
 
     status_df = pd.concat(frames, ignore_index=True)
     status_df = status_df[status_df["part_key"].astype(str).str.strip() != ""].copy()
     if status_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "part_key",
-                "part_no",
-                "description_status",
-                "situacion_archivo",
-                "ubicacion",
-                "locacion_nodum",
-                "comentarios_archivo",
-                "fuente_status",
-            ]
-        )
+        return empty_mudanza_status_df()
 
-    priority_map = {"MUERTO": 30, "ARRIETA": 20, "AUDISTOCK": 10}
+    status_df["stock_status"] = pd.to_numeric(status_df["stock_status"], errors="coerce").fillna(0.0)
+    priority_map = {"MUERTO": 30, "ARRIETA": 20}
+    source_priority = {"STOCK": 50, "STOCK MUERTO": 40, "ARRIETA": 40, "AUDISTOCK": 20, "CONTROL ARRIETA": 10}
     status_df["priority"] = status_df["situacion_archivo"].map(priority_map).fillna(0)
-    status_df = status_df.sort_values(["part_key", "priority"], ascending=[True, False])
+    status_df["source_priority"] = status_df["fuente_status"].map(source_priority).fillna(0)
+    status_df = status_df.sort_values(
+        ["part_key", "priority", "source_priority", "stock_status"],
+        ascending=[True, False, False, False],
+    )
+
     return (
         status_df.groupby("part_key", as_index=False)
         .agg(
             part_no=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
             description_status=("description_status", first_non_empty),
             situacion_archivo=("situacion_archivo", first_non_empty),
+            stock_status=("stock_status", "max"),
             ubicacion=("ubicacion", join_unique_text),
             locacion_nodum=("locacion_nodum", join_unique_text),
             comentarios_archivo=("comentarios_archivo", join_unique_text),
@@ -1130,39 +1244,93 @@ def build_mudanza_dataset(
     status_df: Optional[pd.DataFrame] = None,
     saved_decisions_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    valid_inventories = [frame.copy() for frame in inventory_frames if isinstance(frame, pd.DataFrame) and not frame.empty]
-    if not valid_inventories:
-        return empty_mudanza_items_df()
+    """Arma la pantalla de Mudanza/Separacion.
 
-    inventory_df = pd.concat(valid_inventories, ignore_index=True)
-    inventory_df = inventory_df[(inventory_df["part_key"].astype(str).str.strip() != "") & (inventory_df["stock"] > 0)].copy()
+    Antes se tomaba como base solo el inventario D012/D0122 y se perdian articulos que estaban
+    en el archivo Stock MUERTO_ARRIETA. Ahora se agregan tambien los articulos marcados en ese
+    archivo, usando su stock_status, para que la separacion refleje lo que hay que apartar/devolver.
+    """
+    valid_inventories = [frame.copy() for frame in inventory_frames if isinstance(frame, pd.DataFrame) and not frame.empty]
+
+    if valid_inventories:
+        inventory_df = pd.concat(valid_inventories, ignore_index=True)
+        inventory_df = inventory_df[
+            (inventory_df["part_key"].astype(str).str.strip() != "")
+            & (pd.to_numeric(inventory_df["stock"], errors="coerce").fillna(0) > 0)
+        ].copy()
+    else:
+        inventory_df = pd.DataFrame(
+            columns=["deposit_code", "deposit_name", "part_key", "part_no", "description", "stock", "ubicacion", "locacion_nodum"]
+        )
+
+    if not inventory_df.empty:
+        inventory_df = (
+            inventory_df.groupby(["deposit_code", "deposit_name", "part_key"], as_index=False)
+            .agg(
+                part_no=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
+                description=("description", first_non_empty),
+                stock=("stock", "sum"),
+                ubicacion=("ubicacion", join_unique_text),
+                locacion_nodum=("locacion_nodum", join_unique_text),
+            )
+        )
+
+    # Agrega articulos que vienen marcados en Stock MUERTO_ARRIETA aunque no hayan quedado
+    # en el inventario D012/D0122 cargado. Evita duplicar los que ya estan en inventario.
+    if status_df is not None and not status_df.empty:
+        status_base = status_df.copy()
+        status_base["stock_status"] = pd.to_numeric(status_base.get("stock_status", 0), errors="coerce").fillna(0.0)
+        status_base = status_base[
+            (status_base["part_key"].astype(str).str.strip() != "")
+            & (status_base["situacion_archivo"].astype(str).str.strip() != "")
+            & (status_base["stock_status"] > 0)
+        ].copy()
+
+        if not status_base.empty:
+            existing_keys = set(inventory_df["part_key"].astype(str).str.strip().tolist()) if not inventory_df.empty else set()
+            missing_status = status_base[~status_base["part_key"].astype(str).str.strip().isin(existing_keys)].copy()
+            if not missing_status.empty:
+                status_inventory_df = pd.DataFrame(
+                    {
+                        "deposit_code": "ARCHIVO",
+                        "deposit_name": "Archivo situacion",
+                        "part_key": missing_status["part_key"].astype(str),
+                        "part_no": missing_status["part_no"].astype(str),
+                        "description": missing_status["description_status"].fillna("").astype(str),
+                        "stock": missing_status["stock_status"],
+                        "ubicacion": missing_status.get("ubicacion", pd.Series("", index=missing_status.index)).fillna("").astype(str),
+                        "locacion_nodum": missing_status.get("locacion_nodum", pd.Series("", index=missing_status.index)).fillna("").astype(str),
+                    }
+                )
+                inventory_df = pd.concat([inventory_df, status_inventory_df], ignore_index=True)
+
     if inventory_df.empty:
         return empty_mudanza_items_df()
 
-    inventory_df = (
-        inventory_df.groupby(["deposit_code", "deposit_name", "part_key"], as_index=False)
-        .agg(
-            part_no=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
-            description=("description", first_non_empty),
-            stock=("stock", "sum"),
-            ubicacion=("ubicacion", join_unique_text),
-            locacion_nodum=("locacion_nodum", join_unique_text),
-        )
-    )
+    analysis_base = analysis_df.copy() if isinstance(analysis_df, pd.DataFrame) else pd.DataFrame()
+    for required_col in ["part_no", "description", "abc", "status"]:
+        if required_col not in analysis_base.columns:
+            analysis_base[required_col] = ""
 
     analysis_lookup = ensure_part_identity_columns(
-        analysis_df[["part_no", "description", "abc", "status"]].copy(),
+        analysis_base[["part_no", "description", "abc", "status"]].copy(),
         allow_mazda_compact=True,
     )
-    analysis_lookup = (
-        analysis_lookup.groupby("part_key", as_index=False)
-        .agg(
-            part_no_analysis=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
-            description_analysis=("description", first_non_empty),
-            frecuencia_abc=("abc", first_non_empty),
-            status_analysis=("status", first_non_empty),
+    analysis_lookup = analysis_lookup[analysis_lookup["part_key"].astype(str).str.strip() != ""].copy()
+    if analysis_lookup.empty:
+        analysis_lookup = pd.DataFrame(
+            columns=["part_key", "part_no_analysis", "description_analysis", "frecuencia_abc", "status_analysis"]
         )
-    )
+    else:
+        analysis_lookup = (
+            analysis_lookup.groupby("part_key", as_index=False)
+            .agg(
+                part_no_analysis=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
+                description_analysis=("description", first_non_empty),
+                frecuencia_abc=("abc", first_non_empty),
+                status_analysis=("status", first_non_empty),
+            )
+        )
 
     result = inventory_df.merge(analysis_lookup, on="part_key", how="left")
     if status_df is not None and not status_df.empty:
@@ -1171,6 +1339,7 @@ def build_mudanza_dataset(
         result["part_no_status"] = ""
         result["description_status"] = ""
         result["situacion_archivo"] = ""
+        result["stock_status"] = 0.0
         result["ubicacion_status"] = ""
         result["locacion_nodum_status"] = ""
 
@@ -1190,27 +1359,27 @@ def build_mudanza_dataset(
     else:
         result["destino_mudanza"] = ""
 
+    for optional_col in ["part_no_analysis", "part_no_status", "description_analysis", "description_status", "ubicacion_status", "locacion_nodum_status"]:
+        if optional_col not in result.columns:
+            result[optional_col] = ""
+
     result["part_no"] = result["part_no"].mask(result["part_no"].astype(str).str.strip() == "", result["part_no_analysis"])
-    if "part_no_status" in result.columns:
-        result["part_no"] = result["part_no"].mask(result["part_no"].astype(str).str.strip() == "", result["part_no_status"])
+    result["part_no"] = result["part_no"].mask(result["part_no"].astype(str).str.strip() == "", result["part_no_status"])
 
     result["description"] = result["description"].mask(
         result["description"].astype(str).str.strip() == "",
         result["description_analysis"],
     )
-    if "description_status" in result.columns:
-        result["description"] = result["description"].mask(
-            result["description"].astype(str).str.strip() == "",
-            result["description_status"],
-        )
+    result["description"] = result["description"].mask(
+        result["description"].astype(str).str.strip() == "",
+        result["description_status"],
+    )
 
-    if "ubicacion_status" in result.columns:
-        result["ubicacion"] = result["ubicacion"].mask(result["ubicacion"].astype(str).str.strip() == "", result["ubicacion_status"])
-    if "locacion_nodum_status" in result.columns:
-        result["locacion_nodum"] = result["locacion_nodum"].mask(
-            result["locacion_nodum"].astype(str).str.strip() == "",
-            result["locacion_nodum_status"],
-        )
+    result["ubicacion"] = result["ubicacion"].mask(result["ubicacion"].astype(str).str.strip() == "", result["ubicacion_status"])
+    result["locacion_nodum"] = result["locacion_nodum"].mask(
+        result["locacion_nodum"].astype(str).str.strip() == "",
+        result["locacion_nodum_status"],
+    )
 
     result["frecuencia_abc"] = result["frecuencia_abc"].fillna("").astype(str).str.strip().replace("", "NO ESTA")
     result["situacion_archivo"] = result.get("situacion_archivo", "").fillna("").astype(str).str.strip()
