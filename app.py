@@ -4272,44 +4272,33 @@ def render_mudanza_tab(
     render_mudanza_feedback()
     st.subheader("Mudanza")
     st.caption(
-        "Analiza stock de D012 (Darkinel Central) y D0122 (Pañol Darkinel), cruza ABC y situacion del articulo, "
-        "y te deja decidir si cada pieza va al Polo Logistico o se queda en Darkinel."
+        "Analiza el stock del depósito cargado, cruza ABC y situación del artículo, "
+        "y te deja decidir si cada pieza va al Polo Logístico, queda en Darkinel o se separa para Arrieta."
     )
 
-    source_col_1, source_col_2 = st.columns(2)
-    inventory_d012_upload = source_col_1.file_uploader(
-        "Inventario D012 / Darkinel Central",
+    inventory_upload = st.file_uploader(
+        "Inventario del depósito a analizar",
         type=["xls", "xlsx"],
-        key=f"mudanza_inventory_d012_{analysis_month}",
-    )
-    inventory_d122_upload = source_col_2.file_uploader(
-        "Inventario D0122 / Pañol Darkinel (opcional)",
-        type=["xls", "xlsx"],
-        key=f"mudanza_inventory_d122_{analysis_month}",
+        key=f"mudanza_inventory_deposito_{analysis_month}",
     )
     status_upload = st.file_uploader(
-        "Archivo situacion articulos (Stock MUERTO_ARRIETA / Audistock / Muerto / Arrieta)",
+        "Archivo situación artículos (Stock MUERTO_ARRIETA / Audistock / Muerto / Arrieta)",
         type=["xlsx"],
         key=f"mudanza_status_{analysis_month}",
     )
 
-    inventory_d012_file = resolve_source_file(inventory_d012_upload, default_inventory_file)
-    inventory_d122_file = inventory_d122_upload
+    inventory_file = resolve_source_file(inventory_upload, default_inventory_file)
     status_file = status_upload
 
     st.dataframe(
         pd.DataFrame(
             [
                 {
-                    "fuente": "Inventario D012",
-                    "archivo": inventory_d012_file.name if inventory_d012_file is not None else "No cargado",
+                    "fuente": "Inventario del depósito a analizar",
+                    "archivo": inventory_file.name if inventory_file is not None else "No cargado",
                 },
                 {
-                    "fuente": "Inventario D0122",
-                    "archivo": inventory_d122_file.name if inventory_d122_file is not None else "No cargado",
-                },
-                {
-                    "fuente": "Situacion articulos",
+                    "fuente": "Situación artículos",
                     "archivo": status_file.name if status_file is not None else "No cargado",
                 },
             ]
@@ -4327,10 +4316,8 @@ def render_mudanza_tab(
 
     inventory_frames = []
     try:
-        if inventory_d012_file is not None:
-            inventory_frames.append(load_mudanza_inventory(inventory_d012_file, fallback_deposit_code="D012"))
-        if inventory_d122_file is not None:
-            inventory_frames.append(load_mudanza_inventory(inventory_d122_file, fallback_deposit_code="D0122"))
+        if inventory_file is not None:
+            inventory_frames.append(load_mudanza_inventory(inventory_file, fallback_deposit_code="DEPOSITO"))
         status_df = load_mudanza_status(status_file) if status_file is not None else pd.DataFrame()
         previous_decisions_df = load_latest_mudanza_decisions(empresa)
         mudanza_df = build_mudanza_dataset(
@@ -4346,8 +4333,8 @@ def render_mudanza_tab(
 
     if mudanza_df.empty:
         st.info(
-            "Carga al menos un inventario D012 o D0122 con stock positivo para trabajar la mudanza. "
-            "El archivo de situacion es opcional, pero recomendado."
+            "Carga el inventario del depósito a analizar con stock positivo para trabajar la mudanza. "
+            "El archivo de situación es opcional, pero recomendado."
         )
     else:
         metric_1, metric_2, metric_3, metric_4, metric_5 = st.columns(5)
