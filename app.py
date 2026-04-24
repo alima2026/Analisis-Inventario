@@ -29,7 +29,7 @@ DEPOSIT_LABELS = {
     "D122": "Pañol Darkinel",
     "D0122": "Pañol Darkinel",
 }
-MUDANZA_DESTINATIONS = ["Pendiente", "Polo Logistico", "Darkinel"]
+MUDANZA_DESTINATIONS = ["Pendiente", "Polo Logistico", "Darkinel", "Arrieta", "Destruccion/Sin valor", "Revisar"]
 EDITABLE_ORDER_SOURCE_TYPE = "pedido_editable_mazda"
 FINAL_MAZDA_ORDER_SOURCE_TYPE = "pedido_final_mazda"
 IMPORTED_ORDER_SOURCE_TYPE = "archivo_pedido_importado"
@@ -472,6 +472,27 @@ def build_mudanza_situation_label(value) -> str:
         return "APARTAR - MUERTO / SIN VALOR"
     if normalized == "ARRIETA":
         return "DEVOLVER - ARRIETA"
+    return "NO ESTA"
+
+
+def build_mudanza_situation_label_with_abc(situation_value, frecuencia_value) -> str:
+    """Resuelve la situacion operativa considerando el ABC.
+
+    La columna Frecuencia/ABC viene del analisis de ventas. Si un articulo figura como A, B o C,
+    no conviene mandarlo directo a destruccion aunque aparezca en la hoja STOCK MUERTO; se marca
+    como conflicto para revision manual.
+    """
+    normalized = normalize_mudanza_situation(situation_value)
+    frecuencia = safe_text(frecuencia_value).upper()
+
+    if normalized == "ARRIETA":
+        return "DEVOLVER - ARRIETA"
+
+    if normalized == "MUERTO":
+        if frecuencia in {"A", "B", "C"}:
+            return f"REVISAR - FIGURA MUERTO PERO ES ABC {frecuencia}"
+        return "APARTAR - MUERTO / SIN VALOR"
+
     return "NO ESTA"
 
 
@@ -1383,7 +1404,10 @@ def build_mudanza_dataset(
 
     result["frecuencia_abc"] = result["frecuencia_abc"].fillna("").astype(str).str.strip().replace("", "NO ESTA")
     result["situacion_archivo"] = result.get("situacion_archivo", "").fillna("").astype(str).str.strip()
-    result["situacion_articulo"] = result["situacion_archivo"].map(build_mudanza_situation_label)
+    result["situacion_articulo"] = result.apply(
+        lambda row: build_mudanza_situation_label_with_abc(row["situacion_archivo"], row["frecuencia_abc"]),
+        axis=1,
+    )
     result["destino_mudanza"] = result["destino_mudanza"].fillna("").astype(str).str.strip()
     result.loc[~result["destino_mudanza"].isin(MUDANZA_DESTINATIONS), "destino_mudanza"] = "Pendiente"
 
@@ -4016,7 +4040,7 @@ def render_mudanza_tab(
         hide_index=True,
     )
     st.caption(
-        "Situacion usa la planilla de estados: AUDISTOCK/ARRIETA = devolver, STOCK MUERTO = apartar, "
+        "Situacion usa la planilla de estados: AUDISTOCK/ARRIETA = devolver, STOCK MUERTO = apartar; si ademas tiene ABC A/B/C queda como REVISAR, "
         "si no aparece en esa planilla queda como NO ESTA. La columna Frecuencia mantiene el ABC por separado."
     )
 
