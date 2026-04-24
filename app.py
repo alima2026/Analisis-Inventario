@@ -461,6 +461,17 @@ def normalize_mudanza_situation(value) -> str:
     return ""
 
 
+def build_mudanza_situation_label(value) -> str:
+    normalized = normalize_mudanza_situation(value)
+    if normalized == "MUERTO":
+        return "APARTAR - MUERTO"
+    if normalized == "ARRIETA":
+        return "DEVOLVER - ARRIETA"
+    if normalized == "AUDISTOCK":
+        return "DEVOLVER - AUDISTOCK"
+    return "NO ESTA"
+
+
 def normalize_order_number(value) -> str:
     return re.sub(r"\s+", "", safe_text(value).upper())
 
@@ -1203,10 +1214,7 @@ def build_mudanza_dataset(
 
     result["frecuencia_abc"] = result["frecuencia_abc"].fillna("").astype(str).str.strip().replace("", "NO ESTA")
     result["situacion_archivo"] = result.get("situacion_archivo", "").fillna("").astype(str).str.strip()
-    result["situacion_articulo"] = result["situacion_archivo"]
-    abc_mask = result["situacion_articulo"].eq("") & result["frecuencia_abc"].isin(["A", "B", "C"])
-    result.loc[abc_mask, "situacion_articulo"] = result.loc[abc_mask, "frecuencia_abc"]
-    result.loc[result["situacion_articulo"].eq(""), "situacion_articulo"] = "NO ESTA"
+    result["situacion_articulo"] = result["situacion_archivo"].map(build_mudanza_situation_label)
     result["destino_mudanza"] = result["destino_mudanza"].fillna("").astype(str).str.strip()
     result.loc[~result["destino_mudanza"].isin(MUDANZA_DESTINATIONS), "destino_mudanza"] = "Pendiente"
 
@@ -3837,6 +3845,10 @@ def render_mudanza_tab(
         ),
         use_container_width=True,
         hide_index=True,
+    )
+    st.caption(
+        "Situacion usa la planilla de estados: AUDISTOCK/ARRIETA = devolver, STOCK MUERTO = apartar, "
+        "si no aparece en esa planilla queda como NO ESTA. La columna Frecuencia mantiene el ABC por separado."
     )
 
     inventory_frames = []
