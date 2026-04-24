@@ -50,14 +50,69 @@ def normalize_part(value) -> str:
     return parse_part_code(value)["display"]
 
 
+def _strip_scanner_suffix(value) -> str:
+    """Devuelve el código limpio cuando viene de lector/scanner.
+
+    Reglas:
+    - KIA/Hyundai puede venir como: 865141W200        JJ15. Se toma 865141W200.
+    - Mazda puede venir sin guiones: BCPV67UC5, DGV288110 02Y, DGK934700 E.
+      Se toma el primer bloque real y luego se genera la clave Mazda 4-2-3.
+    - Algunos lectores agregan coma, punto y coma o texto de lote. Se corta en el primer
+      separador claro y en el primer bloque útil.
+    """
+    if pd.isna(value):
+        return ""
+
+    text = str(value).strip().upper().replace("ASTERISCO", "*")
+    text = re.sub(r"^[#:\s]+", "", text)
+    if not text:
+        return ""
+
+    # Si pegan varios códigos o el lector agrega separadores, trabajar con el primero.
+    first_segment = re.split(r"[;,|]", text, maxsplit=1)[0].strip()
+    tokens = [token.strip() for token in re.split(r"\s+", first_segment) if token.strip()]
+    if not tokens:
+        return ""
+
+    first = tokens[0]
+    first_plain = re.sub(r"[^A-Z0-9]", "", first)
+
+    # Caso lector: código largo + sufijo corto de etiqueta/lote.
+    # Ejemplos:
+    #   865141W200 JJ15 -> 865141W200
+    #   DGV288110 02Y   -> DGV288110
+    #   DGK934700 E     -> DGK934700
+    if len(tokens) >= 2 and len(first_plain) >= 8 and re.search(r"\d", first_plain):
+        return first
+
+    return first_segment
+
+
 def _clean_part_text(value) -> str:
     if pd.isna(value):
         return ""
-    text = str(value).strip().upper()
+    text = _strip_scanner_suffix(value)
     text = text.replace("ASTERISCO", "*")
     text = re.sub(r"\s+", "", text)
+    # Mantener solo caracteres que pueden formar códigos de pieza.
+    text = re.sub(r"[^A-Z0-9\-*()]", "", text)
     return text
 
+
+def _format_mazda_compact_base(compact_text: str) -> str:
+    """Formatea la familia Mazda compacta 4-2-3.
+
+    BCPV67UC5    -> BCPV-67-UC5
+    DGV288110    -> DGV2-88-110
+    B63114302C02 -> B631-14-302
+
+    Para evitar falsos positivos con KIA/Hyundai, solo se aplica si los primeros
+    4 caracteres contienen al menos una letra.
+    """
+    compact = re.sub(r"[^A-Z0-9]", "", str(compact_text).upper())
+    if len(compact) >= 9 and re.search(r"[A-Z]", compact[:4]):
+        return f"{compact[:4]}-{compact[4:6]}-{compact[6:9]}"
+    return ""
 
 def _revision_rank(revision: str) -> int:
     if isinstance(revision, str) and re.fullmatch(r"[A-Z]", revision):
@@ -113,8 +168,10 @@ def parse_part_code(value, allow_mazda_compact: bool = False) -> dict:
             }
 
     compact_text = text.replace("-", "")
-    if explicit_revision or allow_mazda_compact:
-        compact_match = re.fullmatch(r"[A-Z0-9]{9,11}", compact_text)
+    # Mazda compacto sin guiones. Para no deformar KIA/Hyundai (ej. 865141W200),
+    # solo se interpreta como Mazda si los primeros 4 caracteres contienen una letra.
+    if (explicit_revision or allow_mazda_compact) and re.search(r"[A-Z]", compact_text[:4] if compact_text else ""):
+        compact_match = re.fullmatch(r"[A-Z0-9]{9,14}", compact_text)
         if compact_match:
             revision = explicit_revision
             core_compact = compact_text
@@ -122,9 +179,11 @@ def parse_part_code(value, allow_mazda_compact: bool = False) -> dict:
                 revision = core_compact[-1]
                 core_compact = core_compact[:-1]
 
-            if len(core_compact) in (9, 10):
-                code_key = f"{core_compact[:4]}-{core_compact[4:6]}-{core_compact[6:]}"
-                display = f"{code_key}{revision}{'*' if is_plaza else ''}"
+            # La clave de familia Mazda es 4-2-3. Lo que viene después es modificación/sufijo.
+            if len(core_compact) >= 9:
+                code_key = f"{core_compact[:4]}-{core_compact[4:6]}-{core_compact[6:9]}"
+                suffix = core_compact[9:]
+                display = f"{code_key}{suffix}{revision}{'*' if is_plaza else ''}"
                 return {
                     "raw": raw_text,
                     "display": display,
@@ -155,9 +214,16 @@ def normalize_part_display(value, allow_mazda_compact: bool = False) -> str:
 
 
 def normalize_part_consulta_key(value) -> str:
-    """Clave de búsqueda: para Mazda 4-2-3 compara por familia/base.
+    """Clave de búsqueda por familia/base.
 
-    Ejemplo: B631-14-302 = B631-14-302A = B631-14-302C02.
+    Mazda:
+    - B631-14-302 = B631-14-302A = B631-14-302C02
+    - BCPV67UC5 = BCPV-67-UC5
+    - DGV288110 02Y = DGV2-88-110
+    - DGK934700 E = DGK9-34-700
+
+    KIA/Hyundai y multimarca:
+    - Se compara el código limpio y, cuando viene de scanner, se toma el primer bloque útil.
     """
     raw_text = _clean_part_text(value)
     if not raw_text:
@@ -172,20 +238,161 @@ def normalize_part_consulta_key(value) -> str:
         text = text[: revision_match.start()]
 
     text = text.strip("-")
-    mazda_hyphen = re.fullmatch(r"([A-Z0-9]{4})-([A-Z0-9]{2})-([0-9]{3})([A-Z0-9]*)", text)
+    mazda_hyphen = re.fullmatch(r"([A-Z0-9]{4})-([A-Z0-9]{2})-([A-Z0-9]{3})([A-Z0-9]*)", text)
     if mazda_hyphen:
         group_1, group_2, group_3, _suffix = mazda_hyphen.groups()
-        return f"{group_1}-{group_2}-{group_3}".upper()
+        # Evita transformar códigos puramente numéricos tipo KIA.
+        if re.search(r"[A-Z]", group_1):
+            return f"{group_1}-{group_2}-{group_3}".upper()
 
     compact_text = re.sub(r"[^A-Z0-9]", "", text)
-    if len(compact_text) >= 9 and re.search(r"[A-Z]", compact_text[:4]) and compact_text[6:9].isdigit():
-        return f"{compact_text[:4]}-{compact_text[4:6]}-{compact_text[6:9]}".upper()
+    mazda_base = _format_mazda_compact_base(compact_text)
+    if mazda_base:
+        return mazda_base.upper()
 
     return normalize_part_key(raw_text, allow_mazda_compact=True).upper()
 
 
 def normalize_part_plain_key(value) -> str:
     return re.sub(r"[^A-Z0-9]", "", _clean_part_text(value).replace("*", "")).upper()
+
+
+
+
+def clean_consulta_input(value) -> dict:
+    """Limpia códigos ingresados a mano o por scanner.
+
+    Casos cubiertos:
+    - KIA/Hyundai: "865141W200        JJ15" => 865141W200.
+    - KIA/Hyundai: "252122E820        JC25" => 252122E820.
+    - Mazda scanner sin guion: "BCPV67UC5" => BCPV-67-UC5.
+    - Mazda scanner con sufijo/lote: "DGV288110 02Y" => DGV2-88-110.
+    - Mazda base con variantes: "B63114302C02" => B631-14-302.
+    - Multimarca: toma el primer bloque útil y prueba recortes razonables.
+    """
+    if pd.isna(value):
+        return {"raw": "", "main": "", "plain": "", "tokens": [], "candidates": []}
+
+    raw_original = str(value).strip().upper().replace("ASTERISCO", "*")
+    raw_original = re.sub(r"^[#:\s]+", "", raw_original)
+    if not raw_original:
+        return {"raw": "", "main": "", "plain": "", "tokens": [], "candidates": []}
+
+    # Si el lector manda varios códigos o termina con separadores, analizar el primero.
+    raw = re.split(r"[;,|]", raw_original, maxsplit=1)[0].strip()
+    tokens = [token.strip() for token in re.split(r"\s+", raw) if token.strip()]
+    token_plain = [re.sub(r"[^A-Z0-9]", "", token) for token in tokens]
+
+    # Mazda tipeado manualmente con espacios: B631 14 302A -> B631-14-302A.
+    if len(tokens) >= 3 and len(token_plain[0]) == 4 and len(token_plain[1]) == 2 and len(token_plain[2]) >= 3:
+        main = f"{token_plain[0]}-{token_plain[1]}-{token_plain[2]}"
+    else:
+        # Scanner o ingreso normal: usar siempre el primer bloque significativo.
+        main = tokens[0] if tokens else raw
+
+    main = re.sub(r"[^A-Z0-9*()\-]", "", str(main).upper().strip())
+    plain = re.sub(r"[^A-Z0-9]", "", main)
+
+    candidates = []
+
+    def add_candidate(candidate):
+        candidate = re.sub(r"[^A-Z0-9*()\-]", "", str(candidate).upper().strip())
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    add_candidate(main)
+    add_candidate(plain)
+
+    # Mazda: la base real para comparar son los primeros 9 caracteres compactos 4-2-3.
+    mazda_base = _format_mazda_compact_base(plain)
+    if mazda_base:
+        add_candidate(mazda_base)
+        add_candidate(mazda_base.replace("-", ""))
+        add_candidate(plain[:9])
+
+    # KIA/Hyundai: normalmente el código útil tiene 10 u 11 caracteres.
+    # Si el lector trae lote pegado, probamos ambas variantes.
+    if len(plain) >= 10 and re.match(r"^[0-9]", plain):
+        add_candidate(plain[:10])
+        if len(plain) >= 11:
+            add_candidate(plain[:11])
+
+    # Multimarca y lectores genéricos: probar cortes habituales.
+    # No reemplaza la coincidencia exacta, solo suma sugerencias/alternativas.
+    for size in (9, 10, 11, 14):
+        if len(plain) >= size:
+            add_candidate(plain[:size])
+
+    return {"raw": raw_original, "main": main, "plain": plain, "tokens": tokens, "candidates": candidates}
+
+
+def build_consulta_candidate_keys(value) -> dict:
+    info = clean_consulta_input(value)
+    key_candidates = set()
+    consulta_candidates = set()
+    plain_candidates = set()
+
+    for candidate in info["candidates"]:
+        if not candidate:
+            continue
+
+        key = normalize_part_key(candidate, allow_mazda_compact=True).upper()
+        consulta_key = normalize_part_consulta_key(candidate).upper()
+        plain_key = normalize_part_plain_key(candidate).upper()
+
+        if key:
+            key_candidates.add(key)
+            plain_candidates.add(re.sub(r"[^A-Z0-9]", "", key))
+        if consulta_key:
+            consulta_candidates.add(consulta_key)
+            plain_candidates.add(re.sub(r"[^A-Z0-9]", "", consulta_key))
+        if plain_key:
+            plain_candidates.add(plain_key)
+
+        # Si es Mazda compactado/formateado, agregar explícitamente la familia base.
+        mazda_base = _format_mazda_compact_base(plain_key)
+        if mazda_base:
+            consulta_candidates.add(mazda_base)
+            plain_candidates.add(mazda_base.replace("-", ""))
+
+    prefix_candidates = {candidate for candidate in plain_candidates if len(candidate) >= 5}
+    return {
+        "input": info,
+        "key_candidates": key_candidates,
+        "consulta_candidates": consulta_candidates,
+        "plain_candidates": plain_candidates,
+        "prefix_candidates": prefix_candidates,
+    }
+
+
+def choose_suggested_destination_for_row(row) -> tuple[str, str, str]:
+    """Sugiere depósito desde frecuencia + rubro + situación.
+
+    Devuelve: deposito_sugerido, rubro_sugerido, motivo.
+    """
+    situacion = str(row.get("situacion_articulo", "")).upper()
+    frecuencia = str(row.get("frecuencia_abc", "")).upper().strip()
+    destino_actual = str(row.get("destino_mudanza", "")).strip()
+    description = row.get("description", "")
+    part_no = row.get("part_no", "")
+    rubro = classify_mudanza_product_family(description, part_no) if "classify_mudanza_product_family" in globals() else "SIN_CLASIFICAR"
+
+    if "AUDISTOCK" in situacion or "ARRIETA" in situacion:
+        return "Arrieta", rubro, "Figura como AUDISTOCK/ARRIETA en archivo de situación."
+
+    if frecuencia not in {"A", "B", "C"}:
+        return "Depósito Muerto", rubro, "No tiene frecuencia de venta A/B/C."
+
+    if rubro == "CARROCERIA":
+        return "Polo Logístico", rubro, "Tiene frecuencia de venta y la descripción corresponde a carrocería."
+
+    if rubro == "SERVICE":
+        return "Darkinel", rubro, "Tiene frecuencia de venta y la descripción corresponde a service/mantenimiento."
+
+    if destino_actual in {"Polo Logistico", "Polo Logístico", "Darkinel", "Arrieta"}:
+        return destino_actual, rubro, "Usa el destino ya calculado por Mudanza."
+
+    return "Revisar", rubro, "Tiene frecuencia, pero no se reconoció claramente carrocería o service."
 
 
 def choose_latest_part_code(values, allow_mazda_compact: bool = False) -> str:
@@ -4218,8 +4425,9 @@ def build_mudanza_export_df(df: pd.DataFrame) -> pd.DataFrame:
 def render_consultar_articulo_tab(analysis_month: str):
     st.subheader("Consultar artículo")
     st.caption(
-        "Ingresá un código para ver si figura en Mudanza. La búsqueda compara exacto, sin guiones "
-        "y variantes Mazda por código base, por ejemplo B631-14-302 = B631-14-302A = B631-14-302C02."
+        "Ingresá o escaneá un código para ver si figura en Mudanza. La búsqueda compara exacto, sin guiones, "
+        "variantes Mazda por código base y lecturas de scanner. Ejemplos: 865141W200 JJ15, "
+        "B631-14-302 = B631-14-302A = B631-14-302C02."
     )
 
     mudanza_df = st.session_state.get(f"mudanza_df_{analysis_month}")
@@ -4228,7 +4436,7 @@ def render_consultar_articulo_tab(analysis_month: str):
         return
 
     with st.form(key=f"consulta_form_{analysis_month}"):
-        query = st.text_input("Código de artículo", placeholder="Ej: B631-14-302")
+        query = st.text_input("Código de artículo", placeholder="Ej: 865141W200 JJ15 o B631-14-302")
         submitted = st.form_submit_button("Consultar", type="primary")
 
     if not submitted:
@@ -4240,9 +4448,13 @@ def render_consultar_articulo_tab(analysis_month: str):
         st.warning("Ingresá un código para buscar.")
         return
 
-    query_key = normalize_part_key(query_clean, allow_mazda_compact=True).upper()
-    query_consulta_key = normalize_part_consulta_key(query_clean).upper()
-    query_plain_key = normalize_part_plain_key(query_clean).upper()
+    query_for_search = _strip_scanner_suffix(query_clean)
+    if query_for_search != query_clean:
+        st.caption(f"Lectura de scanner detectada. Se buscará el código base: {query_for_search}")
+
+    query_key = normalize_part_key(query_for_search, allow_mazda_compact=True).upper()
+    query_consulta_key = normalize_part_consulta_key(query_for_search).upper()
+    query_plain_key = normalize_part_plain_key(query_for_search).upper()
 
     df = mudanza_df.copy()
     df = ensure_part_identity_columns(df, allow_mazda_compact=True)
@@ -4271,7 +4483,7 @@ def render_consultar_articulo_tab(analysis_month: str):
         partial = False
 
     if matches.empty:
-        st.error(f"No encontré el artículo {query_clean} en la base actual de Mudanza.")
+        st.error(f"No encontré el artículo {query_for_search} en la base actual de Mudanza.")
         st.caption("Revisá guiones, letra final, variantes Mazda o que el archivo correcto esté cargado.")
         return
 
