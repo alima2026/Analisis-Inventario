@@ -154,6 +154,48 @@ def normalize_part_display(value, allow_mazda_compact: bool = False) -> str:
     return parse_part_code(value, allow_mazda_compact=allow_mazda_compact)["display"]
 
 
+def normalize_part_consulta_key(value) -> str:
+    """Clave de busqueda para consulta de articulos.
+
+    Para codigos Mazda con formato base 4-2-3, compara solo la familia/base:
+    B631-14-302 = B631-14-302A = B631-14-302C02.
+    Para el resto mantiene la clave normalizada habitual.
+    """
+    raw_text = _clean_part_text(value)
+    if not raw_text:
+        return ""
+
+    text = raw_text
+    if text.endswith("*"):
+        text = text[:-1]
+
+    revision_match = re.search(r"\(([A-Z0-9]+)\)$", text)
+    if revision_match:
+        text = text[: revision_match.start()]
+
+    text = text.strip("-")
+
+    # Codigo Mazda con guiones: 4 caracteres - 2 caracteres - 3 numeros + posible modificacion.
+    # Ejemplos equivalentes: B631-14-302, B631-14-302A, B631-14-302C02.
+    mazda_hyphen = re.fullmatch(r"([A-Z0-9]{4})-([A-Z0-9]{2})-([0-9]{3})([A-Z0-9]*)", text)
+    if mazda_hyphen:
+        group_1, group_2, group_3, _suffix = mazda_hyphen.groups()
+        return f"{group_1}-{group_2}-{group_3}".upper()
+
+    compact_text = re.sub(r"[^A-Z0-9]", "", text)
+
+    # Variante compacta Mazda. Exige una letra en los primeros 4 caracteres para no transformar
+    # codigos puramente numericos de otras marcas.
+    if len(compact_text) >= 9 and re.search(r"[A-Z]", compact_text[:4]) and compact_text[6:9].isdigit():
+        return f"{compact_text[:4]}-{compact_text[4:6]}-{compact_text[6:9]}".upper()
+
+    return normalize_part_key(raw_text, allow_mazda_compact=True).upper()
+
+
+def normalize_part_plain_key(value) -> str:
+    return re.sub(r"[^A-Z0-9]", "", _clean_part_text(value).replace("*", "")).upper()
+
+
 def choose_latest_part_code(values, allow_mazda_compact: bool = False) -> str:
     infos = [
         parse_part_code(value, allow_mazda_compact=allow_mazda_compact)
@@ -4177,21 +4219,34 @@ def render_consultar_articulo_tab(analysis_month: str):
     )
     query_clean = safe_text(query)
     if not query_clean:
-        st.info("Escribe un codigo y el sistema buscara coincidencia exacta por codigo normalizado.")
+        st.info("Escribe un codigo. El sistema busca el codigo exacto y tambien variantes Mazda por base, por ejemplo B631-14-302 = B631-14-302A = B631-14-302C02.")
         return
 
     query_key = normalize_part_key(query_clean, allow_mazda_compact=True)
     query_display = normalize_part_display(query_clean, allow_mazda_compact=True)
+    query_consulta_key = normalize_part_consulta_key(query_clean)
+    query_plain_key = normalize_part_plain_key(query_clean)
 
     df = mudanza_df.copy()
     df = ensure_part_identity_columns(df, allow_mazda_compact=True)
-    exact_df = df[df["part_key"].astype(str).str.upper() == query_key.upper()].copy()
+    df["_consulta_key"] = df["part_no"].map(normalize_part_consulta_key)
+    df["_part_key_upper"] = df["part_key"].astype(str).str.upper()
+    df["_plain_part_no"] = df["part_no"].map(normalize_part_plain_key)
+    df["_plain_part_key"] = df["part_key"].map(normalize_part_plain_key)
+
+    exact_df = df[
+        (df["_part_key_upper"] == query_key.upper())
+        | (df["_consulta_key"] == query_consulta_key)
+        | (df["_plain_part_no"] == query_plain_key)
+        | (df["_plain_part_key"] == query_plain_key)
+    ].copy()
 
     if exact_df.empty:
-        needle = query_clean.upper().replace(" ", "")
+        needle = query_plain_key
         text_mask = (
-            df["part_no"].astype(str).str.upper().str.replace(" ", "", regex=False).str.contains(needle, na=False)
-            | df["part_key"].astype(str).str.upper().str.replace(" ", "", regex=False).str.contains(needle, na=False)
+            df["_plain_part_no"].astype(str).str.contains(needle, na=False)
+            | df["_plain_part_key"].astype(str).str.contains(needle, na=False)
+            | df["_consulta_key"].astype(str).str.replace("-", "", regex=False).str.contains(needle, na=False)
             | df["description"].astype(str).str.upper().str.contains(query_clean.upper(), na=False)
         )
         matches_df = df[text_mask].copy()
@@ -4199,13 +4254,21 @@ def render_consultar_articulo_tab(analysis_month: str):
             st.error(f"No encontre el articulo {query_display or query_clean} en la base actual de Mudanza.")
             st.caption(
                 "Esto significa que no aparecio en el inventario cargado ni en el archivo de situacion usado para esta corrida. "
-                "Revisa guiones, letra final del codigo o que el archivo correcto este cargado."
+                "Ahora tambien se comparan las variantes Mazda por codigo base: por ejemplo "
+                "B631-14-302, B631-14-302A y B631-14-302C02 se consideran el mismo articulo."
             )
             return
-        st.warning("No hubo coincidencia exacta por codigo normalizado. Muestro coincidencias parciales.")
+        st.warning("No hubo coincidencia exacta. Muestro coincidencias parciales por codigo o descripcion.")
         result_df = matches_df
     else:
-        st.success(f"Articulo encontrado: {query_display or query_clean}")
+        if query_consulta_key and query_consulta_key != query_key.upper():
+            st.success(f"Articulo encontrado por codigo base: {query_consulta_key}")
+            st.caption(
+                "Para codigos Mazda se comparan los primeros 11 caracteres del formato 4-2-3. "
+                "Ejemplo: B631-14-302 coincide con B631-14-302A o B631-14-302C02."
+            )
+        else:
+            st.success(f"Articulo encontrado: {query_display or query_clean}")
         result_df = exact_df
 
     total_units = float(pd.to_numeric(result_df["stock"], errors="coerce").fillna(0).sum())
