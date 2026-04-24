@@ -29,7 +29,7 @@ DEPOSIT_LABELS = {
     "D122": "Pañol Darkinel",
     "D0122": "Pañol Darkinel",
 }
-MUDANZA_DESTINATIONS = ["Pendiente", "Polo Logistico", "Darkinel", "Arrieta", "Destruccion/Sin valor", "Revisar"]
+MUDANZA_DESTINATIONS = ["Pendiente", "Arrieta", "Polo Logistico", "Darkinel", "Revisar"]
 EDITABLE_ORDER_SOURCE_TYPE = "pedido_editable_mazda"
 FINAL_MAZDA_ORDER_SOURCE_TYPE = "pedido_final_mazda"
 IMPORTED_ORDER_SOURCE_TYPE = "archivo_pedido_importado"
@@ -155,11 +155,9 @@ def normalize_part_display(value, allow_mazda_compact: bool = False) -> str:
 
 
 def normalize_part_consulta_key(value) -> str:
-    """Clave de busqueda para consulta de articulos.
+    """Clave de búsqueda: para Mazda 4-2-3 compara por familia/base.
 
-    Para codigos Mazda con formato base 4-2-3, compara solo la familia/base:
-    B631-14-302 = B631-14-302A = B631-14-302C02.
-    Para el resto mantiene la clave normalizada habitual.
+    Ejemplo: B631-14-302 = B631-14-302A = B631-14-302C02.
     """
     raw_text = _clean_part_text(value)
     if not raw_text:
@@ -174,18 +172,12 @@ def normalize_part_consulta_key(value) -> str:
         text = text[: revision_match.start()]
 
     text = text.strip("-")
-
-    # Codigo Mazda con guiones: 4 caracteres - 2 caracteres - 3 numeros + posible modificacion.
-    # Ejemplos equivalentes: B631-14-302, B631-14-302A, B631-14-302C02.
     mazda_hyphen = re.fullmatch(r"([A-Z0-9]{4})-([A-Z0-9]{2})-([0-9]{3})([A-Z0-9]*)", text)
     if mazda_hyphen:
         group_1, group_2, group_3, _suffix = mazda_hyphen.groups()
         return f"{group_1}-{group_2}-{group_3}".upper()
 
     compact_text = re.sub(r"[^A-Z0-9]", "", text)
-
-    # Variante compacta Mazda. Exige una letra en los primeros 4 caracteres para no transformar
-    # codigos puramente numericos de otras marcas.
     if len(compact_text) >= 9 and re.search(r"[A-Z]", compact_text[:4]) and compact_text[6:9].isdigit():
         return f"{compact_text[:4]}-{compact_text[4:6]}-{compact_text[6:9]}".upper()
 
@@ -194,87 +186,6 @@ def normalize_part_consulta_key(value) -> str:
 
 def normalize_part_plain_key(value) -> str:
     return re.sub(r"[^A-Z0-9]", "", _clean_part_text(value).replace("*", "")).upper()
-
-
-def build_consulta_fingerprint(df: pd.DataFrame) -> str:
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return "empty"
-    cols = tuple(str(col) for col in df.columns)
-    return f"{id(df)}|{len(df)}|{cols}"
-
-
-def build_consulta_index_df(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out = ensure_part_identity_columns(out, allow_mazda_compact=True)
-    if "description" not in out.columns:
-        out["description"] = ""
-
-    out["_consulta_key"] = out["part_no"].map(normalize_part_consulta_key).astype(str).str.upper()
-    out["_consulta_key_plain"] = out["_consulta_key"].str.replace("-", "", regex=False).str.upper()
-    out["_part_key_upper"] = out["part_key"].fillna("").astype(str).str.upper()
-    out["_plain_part_no"] = out["part_no"].map(normalize_part_plain_key).astype(str).str.upper()
-    out["_plain_part_key"] = out["part_key"].map(normalize_part_plain_key).astype(str).str.upper()
-    out["_description_upper"] = out["description"].fillna("").astype(str).str.upper()
-    return out
-
-
-def build_consulta_lookup(index_df: pd.DataFrame) -> dict:
-    lookup = {}
-    key_columns = ["_part_key_upper", "_consulta_key", "_consulta_key_plain", "_plain_part_no", "_plain_part_key"]
-    for col in key_columns:
-        if col not in index_df.columns:
-            continue
-        for row_index, value in index_df[col].items():
-            key = safe_text(value).upper()
-            if not key:
-                continue
-            lookup.setdefault(key, set()).add(row_index)
-    return lookup
-
-
-def get_consulta_index(analysis_month: str, mudanza_df: pd.DataFrame):
-    cache_key = f"consulta_index_fast_{analysis_month}"
-    fingerprint = build_consulta_fingerprint(mudanza_df)
-    cached = st.session_state.get(cache_key)
-    if isinstance(cached, dict) and cached.get("fingerprint") == fingerprint:
-        return cached["index_df"], cached["lookup"]
-
-    index_df = build_consulta_index_df(mudanza_df)
-    lookup = build_consulta_lookup(index_df)
-    st.session_state[cache_key] = {
-        "fingerprint": fingerprint,
-        "index_df": index_df,
-        "lookup": lookup,
-    }
-    return index_df, lookup
-
-
-def search_consulta_index(index_df: pd.DataFrame, lookup: dict, query_clean: str):
-    query_key = normalize_part_key(query_clean, allow_mazda_compact=True).upper()
-    query_display = normalize_part_display(query_clean, allow_mazda_compact=True)
-    query_consulta_key = normalize_part_consulta_key(query_clean).upper()
-    query_plain_key = normalize_part_plain_key(query_clean).upper()
-
-    exact_keys = {key for key in [query_key, query_consulta_key, query_plain_key] if key}
-    matched_indices = set()
-    for key in exact_keys:
-        matched_indices.update(lookup.get(key, set()))
-
-    if matched_indices:
-        result_df = index_df.loc[sorted(matched_indices)].copy()
-        return result_df, "exact", query_display, query_key, query_consulta_key, query_plain_key
-
-    needle = query_plain_key
-    if not needle:
-        return index_df.iloc[0:0].copy(), "empty", query_display, query_key, query_consulta_key, query_plain_key
-
-    text_mask = (
-        index_df["_plain_part_no"].astype(str).str.contains(needle, na=False)
-        | index_df["_plain_part_key"].astype(str).str.contains(needle, na=False)
-        | index_df["_consulta_key_plain"].astype(str).str.contains(needle, na=False)
-        | index_df["_description_upper"].astype(str).str.contains(query_clean.upper(), na=False)
-    )
-    return index_df[text_mask].copy(), "partial", query_display, query_key, query_consulta_key, query_plain_key
 
 
 def choose_latest_part_code(values, allow_mazda_compact: bool = False) -> str:
@@ -575,12 +486,7 @@ def join_unique_text(values, separator: str = " | ") -> str:
 
 
 def normalize_mudanza_situation(value) -> str:
-    """Normaliza la decision operativa de separacion.
-
-    Regla definida por el usuario:
-    - AUDISTOCK / ARRIETA => devolver a Arrieta.
-    - STOCK MUERTO / MUERTO => apartar para posible destruccion o sin valor.
-    """
+    """Normaliza la decisión operativa que viene del archivo Stock MUERTO_ARRIETA."""
     text = safe_text(value).upper()
     if not text:
         return ""
@@ -594,58 +500,59 @@ def normalize_mudanza_situation(value) -> str:
 def build_mudanza_situation_label(value) -> str:
     normalized = normalize_mudanza_situation(value)
     if normalized == "MUERTO":
-        return "APARTAR - MUERTO / SIN VALOR"
+        return "APARTAR - STOCK MUERTO PARA DEVOLVER"
     if normalized == "ARRIETA":
         return "DEVOLVER - ARRIETA"
     return NO_STATUS_LABEL
 
 
-def _normalize_for_keyword_search(value) -> str:
-    """Normaliza texto para buscar palabras clave sin depender de acentos ni signos."""
-    text = safe_text(value).upper()
-    replacements = {
-        "Á": "A",
-        "É": "E",
-        "Í": "I",
-        "Ó": "O",
-        "Ú": "U",
-        "Ü": "U",
-        "Ñ": "N",
-    }
-    for old_char, new_char in replacements.items():
-        text = text.replace(old_char, new_char)
-    text = re.sub(r"[^A-Z0-9]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
 def normalize_abc_frequency(value) -> str:
-    """Devuelve A, B o C cuando la frecuencia del analisis es valida."""
     text = safe_text(value).upper().strip()
     if text in {"A", "B", "C"}:
         return text
     return ""
 
 
+def _normalize_for_keyword_search(value) -> str:
+    text = safe_text(value).upper()
+    replacements = {
+        "Á": "A", "É": "E", "Í": "I", "Ó": "O", "Ú": "U", "Ü": "U", "Ñ": "N",
+        "/": " ", "-": " ", ".": " ", ",": " ", "(": " ", ")": " ",
+    }
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def classify_mudanza_product_family(description_value, part_no_value="") -> str:
-    """Clasifica el articulo para decidir destino si era STOCK MUERTO pero el ABC dice que rota."""
+    """Clasifica SERVICE/CARROCERIA para decidir destino cuando el análisis A/B/C lo saca de muerto."""
     text = _normalize_for_keyword_search(f"{description_value} {part_no_value}")
     if not text:
         return "SIN_CLASIFICAR"
 
     body_keywords = [
-        "CARROCERIA", "ESPOLON", "SPOILER", "GUARDABARRO", "GUARDA BARRO", "FENDER",
-        "PARABRISAS", "WINDSHIELD", "MOLDURA", "MOLDING", "MOULDING", "OPTICA",
-        "SEMI OPTICA", "SEMIOPTICA", "FAROL", "FARO", "LAMP", "HEAD LAMP", "HEADLAMP",
-        "TAIL LAMP", "TAILLAMP", "STOP LAMP", "BUMPER", "PARAGOLPE", "CAPOT", "HOOD",
-        "PUERTA", "DOOR", "TAPA BAUL", "TRUNK LID", "PANEL", "REJILLA", "GRILLE", "GRILL",
-        "ESPEJO", "MIRROR", "CRISTAL", "VIDRIO", "GLASS", "GUARDAFANGO", "LODERA",
+        "CARROCERIA", "CHAPA", "ESPOLON", "CAPOT", "CAPO", "PARAGOLPE", "PARACHOQUE",
+        "GUARDABARRO", "GUARDA BARRO", "GUARDAFANGO", "FENDER", "LODERA", "PUERTA", "PORTON",
+        "TAPA BAUL", "TAPA DE BAUL", "CARETA", "REJILLA", "MASCARA", "MOLDURA", "PANEL",
+        "VIDRIO", "PARABRISAS", "LUNETA", "TECHO", "OPTICA", "SEMI OPTICA", "SEMIOPTICA",
+        "FARO", "FAROL", "FAROLIN", "STOP", "ESPEJO", "CRISTAL", "BISAGRA", "EMBLEMA",
+        "BODY", "SPOILER", "HOOD", "BONNET", "BUMPER", "GRILLE", "GRILL", "FENDER", "DOOR",
+        "TRUNK LID", "LIFTGATE", "TAILGATE", "GATE", "MOLDING", "MOULDING", "PANEL", "ROOF",
+        "WINDSHIELD", "WINDSCREEN", "GLASS", "BACK GLASS", "QUARTER GLASS", "LAMP", "HEADLAMP",
+        "HEAD LAMP", "TAIL LAMP", "TAILLAMP", "FOG LAMP", "FOGLAMP", "COMBINATION LAMP",
+        "MIRROR", "GARNISH", "BEZEL", "FASCIA",
     ]
     service_keywords = [
-        "AMORTIGUADOR", "SHOCK", "STRUT", "FILTRO", "FILTER", "ACEITE", "OIL", "POLEN",
-        "CABIN", "BUJIA", "SPARK PLUG", "PASTILLA", "PASTILLAS", "BRAKE PAD",
-        "DISCO FRENO", "DISCO DE FRENO", "BRAKE DISC", "BRAKE ROTOR", "ROTOR", "CORREA",
-        "BELT", "TENSOR", "TENSIONER", "ESCOBILLA", "WIPER", "LIMPIAPARABRISAS",
-        "ZAPATA", "BRAKE SHOE", "FRENO", "FRENOS", "KIT DISTRIBUCION", "DISTRIBUCION",
+        "SERVICE", "MANTENIMIENTO", "FILTRO", "FILTROS", "ACEITE", "POLEN", "AIRE", "COMBUSTIBLE",
+        "BUJIA", "BUJIAS", "PASTILLA", "PASTILLAS", "DISCO FRENO", "DISCO DE FRENO", "DISCOS",
+        "CORREA", "CORREAS", "AMORTIGUADOR", "AMORTIGUADORES", "TENSOR", "TENSORES", "ESCOBILLA",
+        "LIMPIAPARABRISAS", "ZAPATA", "FRENO", "FRENOS", "KIT DISTRIBUCION", "DISTRIBUCION",
+        "BOMBA AGUA", "TERMOSTATO", "RULEMAN", "RODAMIENTO",
+        "FILTER", "OIL", "AIR FILTER", "CABIN", "CABIN FILTER", "POLLEN", "FUEL FILTER",
+        "SPARK PLUG", "BRAKE PAD", "BRAKE PADS", "BRAKE DISC", "BRAKE ROTOR", "ROTOR", "BELT",
+        "DRIVE BELT", "TIMING BELT", "TENSIONER", "SHOCK", "SHOCK ABSORBER", "STRUT", "WIPER",
+        "BRAKE SHOE", "WATER PUMP", "THERMOSTAT", "BEARING",
     ]
 
     def has_keyword(keywords):
@@ -656,7 +563,6 @@ def classify_mudanza_product_family(description_value, part_no_value="") -> str:
                 return True
         return False
 
-    # Primero carroceria: FARO/OPTICA/LAMP/MOLDURA/etc. deben ir al Polo Logistico.
     if has_keyword(body_keywords):
         return "CARROCERIA"
     if has_keyword(service_keywords):
@@ -665,15 +571,6 @@ def classify_mudanza_product_family(description_value, part_no_value="") -> str:
 
 
 def build_mudanza_situation_label_with_abc(situation_value, frecuencia_value, description_value="", part_no_value="") -> str:
-    """Etiqueta operativa final combinando Comentario + frecuencia del analisis.
-
-    Reglas:
-    - AUDISTOCK / ARRIETA => DEVOLVER - ARRIETA.
-    - STOCK MUERTO + frecuencia A/B/C + service => FRECUENCIA A/B/C - SERVICE - SEGUN ANALISIS.
-    - STOCK MUERTO + frecuencia A/B/C + carroceria => FRECUENCIA A/B/C - CARROCERIA - SEGUN ANALISIS.
-    - STOCK MUERTO + frecuencia A/B/C sin clasificar => FRECUENCIA A/B/C - SEGUN ANALISIS.
-    - STOCK MUERTO sin frecuencia A/B/C => APARTAR - STOCK MUERTO PARA DEVOLVER.
-    """
     normalized = normalize_mudanza_situation(situation_value)
     frecuencia = normalize_abc_frequency(frecuencia_value)
 
@@ -687,14 +584,13 @@ def build_mudanza_situation_label_with_abc(situation_value, frecuencia_value, de
                 return f"FRECUENCIA {frecuencia} - CARROCERIA - SEGUN ANALISIS"
             if product_family == "SERVICE":
                 return f"FRECUENCIA {frecuencia} - SERVICE - SEGUN ANALISIS"
-            return f"FRECUENCIA {frecuencia} - SEGUN ANALISIS"
+            return f"FRECUENCIA {frecuencia} - REVISAR RUBRO - SEGUN ANALISIS"
         return "APARTAR - STOCK MUERTO PARA DEVOLVER"
 
     return NO_STATUS_LABEL
 
 
 def suggest_mudanza_destination(situation_label: str, current_destination: str = "") -> str:
-    """Precarga destino cuando la regla es directa, sin pisar decisiones ya guardadas."""
     current = safe_text(current_destination)
     if current and current != "Pendiente" and current in MUDANZA_DESTINATIONS:
         return current
@@ -704,13 +600,14 @@ def suggest_mudanza_destination(situation_label: str, current_destination: str =
         return "Arrieta"
     if situation.startswith("FRECUENCIA ") and "CARROCERIA" in situation:
         return "Polo Logistico"
-    if situation.startswith("FRECUENCIA "):
+    if situation.startswith("FRECUENCIA ") and "SERVICE" in situation:
         return "Darkinel"
+    if situation.startswith("FRECUENCIA "):
+        return "Revisar"
     return "Pendiente"
 
 
 def build_mudanza_stock_control_label(row) -> str:
-    """Compara stock del inventario contra stock declarado en Stock MUERTO_ARRIETA."""
     inventory_qty = float(pd.to_numeric(pd.Series([row.get("stock", 0)]), errors="coerce").fillna(0).iloc[0])
     status_qty = float(pd.to_numeric(pd.Series([row.get("stock_archivo_situacion", 0)]), errors="coerce").fillna(0).iloc[0])
     has_status = safe_text(row.get("situacion_archivo", "")) != "" or status_qty > 0
@@ -723,7 +620,6 @@ def build_mudanza_stock_control_label(row) -> str:
     if abs(inventory_qty - status_qty) < 0.0001:
         return "OK - CANTIDAD IGUAL"
     return "DIFERENCIA INVENTARIO VS ARCHIVO"
-
 
 def normalize_order_number(value) -> str:
     return re.sub(r"\s+", "", safe_text(value).upper())
@@ -1166,21 +1062,77 @@ def empty_mudanza_items_df() -> pd.DataFrame:
         ]
     )
 
-
 def load_mudanza_inventory(uploaded_file, fallback_deposit_code: str = "") -> pd.DataFrame:
-    raw = pd.read_excel(clone_excel_source(uploaded_file), header=None)
-    requested_code = canonicalize_deposit_code(fallback_deposit_code)
-    inventory_block, detected_code = extract_inventory_block(raw, requested_code)
-    deposit_code = detected_code or detect_inventory_deposit_from_raw(raw, getattr(uploaded_file, "name", ""))
-    deposit_code = canonicalize_deposit_code(deposit_code or requested_code or safe_text(fallback_deposit_code).upper())
-    deposit_code = deposit_code or "SIN_DEP"
-    deposit_name = DEPOSIT_LABELS.get(deposit_code, deposit_code)
+    """Lee el inventario del depósito a analizar.
 
-    df = inventory_block.iloc[:, [2, 8, 16, 20]].copy()
-    df.columns = ["part_no", "description", "unit", "stock"]
+    Si se carga por error un archivo de ventas u otro formato, no rompe la app:
+    devuelve vacío y la pestaña Mudanza puede seguir mostrando lo que venga del
+    archivo Stock MUERTO_ARRIETA.
+    """
+    if uploaded_file is None:
+        return empty_mudanza_items_df()
+
+    try:
+        raw = pd.read_excel(clone_excel_source(uploaded_file), header=None)
+    except Exception:
+        return empty_mudanza_items_df()
+
+    if raw.empty:
+        return empty_mudanza_items_df()
+
+    requested_code = canonicalize_deposit_code(fallback_deposit_code)
+    detected_code = detect_inventory_deposit_from_raw(raw, getattr(uploaded_file, "name", ""))
+    deposit_code = canonicalize_deposit_code(detected_code or requested_code or "DEPOSITO")
+    if deposit_code in {"D012", "D122"}:
+        deposit_name = DEPOSIT_LABELS.get(deposit_code, deposit_code)
+    else:
+        deposit_code = "DEPOSITO"
+        deposit_name = "Deposito a analizar"
+
+    frames = []
+
+    try:
+        inventory_block, detected_block_code = extract_inventory_block(raw, requested_code)
+        if detected_block_code:
+            detected_block_code = canonicalize_deposit_code(detected_block_code)
+            if detected_block_code in {"D012", "D122"}:
+                deposit_code = detected_block_code
+                deposit_name = DEPOSIT_LABELS.get(deposit_code, deposit_code)
+        if inventory_block.shape[1] > 20:
+            fixed_df = inventory_block.iloc[:, [2, 8, 16, 20]].copy()
+            fixed_df.columns = ["part_no", "description", "unit", "stock"]
+            frames.append(fixed_df)
+    except Exception:
+        pass
+
+    try:
+        header_df = pd.read_excel(clone_excel_source(uploaded_file))
+        part_col = _find_column(header_df, ["part_no", "part no", "codigo", "cod", "articulo", "codigo articulo"])
+        desc_col = _find_column(header_df, ["description", "descripcion", "descripcion articulo", "nombre", "nom art"])
+        stock_col = _find_column(header_df, ["stock", "cantidad", "existencia", "saldo"])
+        if part_col is not None and stock_col is not None:
+            fallback_df = pd.DataFrame(
+                {
+                    "part_no": header_df[part_col],
+                    "description": header_df[desc_col] if desc_col is not None else "",
+                    "unit": "",
+                    "stock": header_df[stock_col],
+                }
+            )
+            frames.append(fallback_df)
+    except Exception:
+        pass
+
+    if not frames:
+        return empty_mudanza_items_df()
+
+    df = pd.concat(frames, ignore_index=True)
     df = df.dropna(subset=["part_no"]).copy()
+    if df.empty:
+        return empty_mudanza_items_df()
+
     df = add_part_identity(df, "part_no", allow_mazda_compact=True)
-    df["description"] = df["description"].astype(str).str.strip()
+    df["description"] = df["description"].fillna("").astype(str).str.strip()
     df["stock"] = safe_numeric(df["stock"])
     df = df[(df["part_key"] != "") & (df["stock"] > 0)].copy()
 
@@ -1207,22 +1159,6 @@ def load_mudanza_inventory(uploaded_file, fallback_deposit_code: str = "") -> pd
     grouped["situacion_articulo"] = ""
     grouped["destino_mudanza"] = "Pendiente"
     return grouped[empty_mudanza_items_df().columns]
-
-
-def empty_mudanza_status_df() -> pd.DataFrame:
-    return pd.DataFrame(
-        columns=[
-            "part_key",
-            "part_no",
-            "description_status",
-            "situacion_archivo",
-            "stock_status",
-            "ubicacion",
-            "locacion_nodum",
-            "comentarios_archivo",
-            "fuente_status",
-        ]
-    )
 
 
 def _normalize_column_label(value) -> str:
@@ -1262,6 +1198,8 @@ def _find_column(df: pd.DataFrame, candidates: list[str]):
 
 
 def _read_excel_sheet(uploaded_file, sheet_name: str, **kwargs) -> pd.DataFrame:
+    if uploaded_file is None:
+        return pd.DataFrame()
     try:
         return pd.read_excel(clone_excel_source(uploaded_file), sheet_name=sheet_name, **kwargs)
     except Exception:
@@ -1470,46 +1408,26 @@ def load_mudanza_status(uploaded_file) -> pd.DataFrame:
         return empty_mudanza_status_df()
 
     status_df["stock_status"] = pd.to_numeric(status_df["stock_status"], errors="coerce").fillna(0.0)
-
-    # La hoja STOCK, columna Comentario, manda: alli el usuario ya definio AUDISTOCK o STOCK MUERTO.
-    # Las otras hojas completan codigos que no esten definidos en STOCK.
-    source_priority = {
-        "STOCK": 100,
-        "STOCK MUERTO": 80,
-        "ARRIETA": 80,
-        "AUDISTOCK": 60,
-        "CONTROL ARRIETA": 60,
-    }
+    priority_map = {"MUERTO": 30, "ARRIETA": 20}
+    source_priority = {"STOCK": 50, "STOCK MUERTO": 40, "ARRIETA": 40, "AUDISTOCK": 20, "CONTROL ARRIETA": 10}
+    status_df["priority"] = status_df["situacion_archivo"].map(priority_map).fillna(0)
     status_df["source_priority"] = status_df["fuente_status"].map(source_priority).fillna(0)
-
-    status_by_source = (
-        status_df.groupby(["part_key", "fuente_status", "situacion_archivo"], as_index=False)
-        .agg(
-            part_no=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
-            description_status=("description_status", first_non_empty),
-            stock_status=("stock_status", "sum"),
-            ubicacion=("ubicacion", join_unique_text),
-            locacion_nodum=("locacion_nodum", join_unique_text),
-            comentarios_archivo=("comentarios_archivo", join_unique_text),
-            source_priority=("source_priority", "max"),
-        )
-    )
-    status_by_source = status_by_source.sort_values(
-        ["part_key", "source_priority", "stock_status"],
-        ascending=[True, False, False],
+    status_df = status_df.sort_values(
+        ["part_key", "priority", "source_priority", "stock_status"],
+        ascending=[True, False, False, False],
     )
 
     return (
-        status_by_source.groupby("part_key", as_index=False)
+        status_df.groupby("part_key", as_index=False)
         .agg(
             part_no=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
             description_status=("description_status", first_non_empty),
             situacion_archivo=("situacion_archivo", first_non_empty),
-            stock_status=("stock_status", "first"),
+            stock_status=("stock_status", "max"),
             ubicacion=("ubicacion", join_unique_text),
             locacion_nodum=("locacion_nodum", join_unique_text),
             comentarios_archivo=("comentarios_archivo", join_unique_text),
-            fuente_status=("fuente_status", first_non_empty),
+            fuente_status=("fuente_status", join_unique_text),
         )
     )
 
@@ -1520,11 +1438,14 @@ def build_mudanza_dataset(
     status_df: Optional[pd.DataFrame] = None,
     saved_decisions_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    """Arma la pantalla de Mudanza/Separacion.
+    """Arma la pantalla de Mudanza/Separación.
 
-    Antes se tomaba como base solo el inventario D012/D0122 y se perdian articulos que estaban
-    en el archivo Stock MUERTO_ARRIETA. Ahora se agregan tambien los articulos marcados en ese
-    archivo, usando su stock_status, para que la separacion refleje lo que hay que apartar/devolver.
+    Base de trabajo:
+    - Inventario del depósito cargado, si existe.
+    - Artículos del archivo Stock MUERTO_ARRIETA con stock positivo, aunque no aparezcan en el inventario.
+
+    El cruce contra el análisis usa también la clave base Mazda 4-2-3 para que
+    B631-14-302, B631-14-302A y B631-14-302C02 sean tratados como la misma familia.
     """
     valid_inventories = [frame.copy() for frame in inventory_frames if isinstance(frame, pd.DataFrame) and not frame.empty]
 
@@ -1551,8 +1472,7 @@ def build_mudanza_dataset(
             )
         )
 
-    # Agrega articulos que vienen marcados en Stock MUERTO_ARRIETA aunque no hayan quedado
-    # en el inventario D012/D0122 cargado. Evita duplicar los que ya estan en inventario.
+    # Agrega artículos que vienen en Stock MUERTO_ARRIETA aunque no estén en el inventario cargado.
     if status_df is not None and not status_df.empty:
         status_base = status_df.copy()
         status_base["stock_status"] = pd.to_numeric(status_base.get("stock_status", 0), errors="coerce").fillna(0.0)
@@ -1572,13 +1492,10 @@ def build_mudanza_dataset(
                         "deposit_name": "Archivo situacion",
                         "part_key": missing_status["part_key"].astype(str),
                         "part_no": missing_status["part_no"].astype(str),
-                        "description": missing_status["description_status"].fillna("").astype(str),
-                        "stock": missing_status["stock_status"],
-                        "stock_archivo_situacion": missing_status["stock_status"],
-                        "diferencia_stock": 0.0,
-                        "control_stock": "SOLO EN ARCHIVO SITUACION",
-                        "ubicacion": missing_status.get("ubicacion", pd.Series("", index=missing_status.index)).fillna("").astype(str),
-                        "locacion_nodum": missing_status.get("locacion_nodum", pd.Series("", index=missing_status.index)).fillna("").astype(str),
+                        "description": missing_status["description_status"].astype(str),
+                        "stock": missing_status["stock_status"].astype(float),
+                        "ubicacion": missing_status.get("ubicacion", ""),
+                        "locacion_nodum": missing_status.get("locacion_nodum", ""),
                     }
                 )
                 inventory_df = pd.concat([inventory_df, status_inventory_df], ignore_index=True)
@@ -1586,32 +1503,67 @@ def build_mudanza_dataset(
     if inventory_df.empty:
         return empty_mudanza_items_df()
 
+    # Lookup de análisis con clave exacta y clave base Mazda.
     analysis_base = analysis_df.copy() if isinstance(analysis_df, pd.DataFrame) else pd.DataFrame()
     for required_col in ["part_no", "description", "abc", "status"]:
         if required_col not in analysis_base.columns:
             analysis_base[required_col] = ""
 
-    analysis_lookup = ensure_part_identity_columns(
+    analysis_lookup_raw = ensure_part_identity_columns(
         analysis_base[["part_no", "description", "abc", "status"]].copy(),
         allow_mazda_compact=True,
     )
-    analysis_lookup = analysis_lookup[analysis_lookup["part_key"].astype(str).str.strip() != ""].copy()
-    if analysis_lookup.empty:
+    analysis_lookup_raw = analysis_lookup_raw[analysis_lookup_raw["part_key"].astype(str).str.strip() != ""].copy()
+    analysis_lookup_raw["familia_key"] = analysis_lookup_raw["part_no"].map(normalize_part_consulta_key)
+
+    if analysis_lookup_raw.empty:
         analysis_lookup = pd.DataFrame(
-            columns=["part_key", "part_no_analysis", "description_analysis", "frecuencia_abc", "status_analysis"]
+            columns=["part_key", "familia_key", "part_no_analysis", "description_analysis", "frecuencia_abc", "status_analysis"]
+        )
+        family_lookup = pd.DataFrame(
+            columns=["familia_key", "part_no_family", "description_family", "frecuencia_abc_family", "status_family"]
         )
     else:
         analysis_lookup = (
-            analysis_lookup.groupby("part_key", as_index=False)
+            analysis_lookup_raw.groupby("part_key", as_index=False)
             .agg(
+                familia_key=("familia_key", first_non_empty),
                 part_no_analysis=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
                 description_analysis=("description", first_non_empty),
                 frecuencia_abc=("abc", first_non_empty),
                 status_analysis=("status", first_non_empty),
             )
         )
+        family_lookup = (
+            analysis_lookup_raw.groupby("familia_key", as_index=False)
+            .agg(
+                part_no_family=("part_no", lambda values: choose_latest_part_code(values, allow_mazda_compact=True)),
+                description_family=("description", first_non_empty),
+                frecuencia_abc_family=("abc", first_non_empty),
+                status_family=("status", first_non_empty),
+            )
+        )
 
-    result = inventory_df.merge(analysis_lookup, on="part_key", how="left")
+    inventory_df["familia_key"] = inventory_df["part_no"].map(normalize_part_consulta_key)
+    result = inventory_df.merge(analysis_lookup, on="part_key", how="left", suffixes=("", "_analysis_exact"))
+    if "familia_key_analysis_exact" in result.columns:
+        result = result.drop(columns=["familia_key_analysis_exact"])
+    result = result.merge(family_lookup, on="familia_key", how="left")
+
+    for col in ["frecuencia_abc", "description_analysis", "status_analysis"]:
+        if col not in result.columns:
+            result[col] = ""
+    result["frecuencia_abc"] = result["frecuencia_abc"].fillna("").astype(str).str.strip()
+    result["frecuencia_abc"] = result["frecuencia_abc"].where(
+        result["frecuencia_abc"].isin(["A", "B", "C"]),
+        result.get("frecuencia_abc_family", "").fillna("").astype(str).str.strip(),
+    )
+    result["description_analysis"] = result["description_analysis"].fillna("").astype(str)
+    result["description_analysis"] = result["description_analysis"].where(
+        result["description_analysis"].str.strip() != "",
+        result.get("description_family", "").fillna("").astype(str),
+    )
+
     if status_df is not None and not status_df.empty:
         result = result.merge(status_df, on="part_key", how="left", suffixes=("", "_status"))
     else:
@@ -1621,6 +1573,7 @@ def build_mudanza_dataset(
         result["stock_status"] = 0.0
         result["ubicacion_status"] = ""
         result["locacion_nodum_status"] = ""
+        result["fuente_status"] = ""
 
     if saved_decisions_df is not None and not saved_decisions_df.empty:
         saved_choices = saved_decisions_df.copy()
@@ -1638,35 +1591,30 @@ def build_mudanza_dataset(
     else:
         result["destino_mudanza"] = ""
 
-    for optional_col in ["part_no_analysis", "part_no_status", "description_analysis", "description_status", "ubicacion_status", "locacion_nodum_status"]:
+    for optional_col in [
+        "part_no_analysis", "part_no_status", "description_analysis", "description_status",
+        "ubicacion_status", "locacion_nodum_status", "stock_status", "situacion_archivo", "fuente_status",
+    ]:
         if optional_col not in result.columns:
             result[optional_col] = ""
 
     result["part_no"] = result["part_no"].mask(result["part_no"].astype(str).str.strip() == "", result["part_no_analysis"])
     result["part_no"] = result["part_no"].mask(result["part_no"].astype(str).str.strip() == "", result["part_no_status"])
 
-    result["description"] = result["description"].mask(
-        result["description"].astype(str).str.strip() == "",
-        result["description_analysis"],
-    )
-    result["description"] = result["description"].mask(
-        result["description"].astype(str).str.strip() == "",
-        result["description_status"],
-    )
+    result["description"] = result["description"].fillna("").astype(str)
+    result["description"] = result["description"].where(result["description"].str.strip() != "", result["description_analysis"].fillna(""))
+    result["description"] = result["description"].where(result["description"].str.strip() != "", result["description_status"].fillna(""))
 
-    result["ubicacion"] = result["ubicacion"].mask(result["ubicacion"].astype(str).str.strip() == "", result["ubicacion_status"])
-    result["locacion_nodum"] = result["locacion_nodum"].mask(
-        result["locacion_nodum"].astype(str).str.strip() == "",
-        result["locacion_nodum_status"],
-    )
+    result["ubicacion"] = result["ubicacion"].fillna("").astype(str)
+    result["locacion_nodum"] = result["locacion_nodum"].fillna("").astype(str)
+    result["ubicacion"] = result["ubicacion"].where(result["ubicacion"].str.strip() != "", result["ubicacion_status"].fillna(""))
+    result["locacion_nodum"] = result["locacion_nodum"].where(result["locacion_nodum"].str.strip() != "", result["locacion_nodum_status"].fillna(""))
 
-    result["frecuencia_abc"] = result["frecuencia_abc"].fillna("").astype(str).str.strip().replace("", NO_ABC_LABEL)
-    result["situacion_archivo"] = result.get("situacion_archivo", "").fillna("").astype(str).str.strip()
+    result["frecuencia_abc"] = result["frecuencia_abc"].fillna("").astype(str).str.strip()
+    result.loc[~result["frecuencia_abc"].isin(["A", "B", "C"]), "frecuencia_abc"] = NO_ABC_LABEL
+    result["situacion_archivo"] = result["situacion_archivo"].fillna("").astype(str).str.strip()
     result["stock"] = pd.to_numeric(result["stock"], errors="coerce").fillna(0.0)
-    result["stock_archivo_situacion"] = pd.to_numeric(
-        result.get("stock_status", result.get("stock_archivo_situacion", 0)),
-        errors="coerce",
-    ).fillna(0.0)
+    result["stock_archivo_situacion"] = pd.to_numeric(result.get("stock_status", 0), errors="coerce").fillna(0.0)
     result["diferencia_stock"] = result["stock"] - result["stock_archivo_situacion"]
     result["control_stock"] = result.apply(build_mudanza_stock_control_label, axis=1)
     result["situacion_articulo"] = result.apply(
@@ -1678,6 +1626,7 @@ def build_mudanza_dataset(
         ),
         axis=1,
     )
+
     result["destino_mudanza"] = result["destino_mudanza"].fillna("").astype(str).str.strip()
     result.loc[~result["destino_mudanza"].isin(MUDANZA_DESTINATIONS), "destino_mudanza"] = "Pendiente"
     result["destino_mudanza"] = result.apply(
@@ -1688,11 +1637,10 @@ def build_mudanza_dataset(
     result["stock"] = pd.to_numeric(result["stock"], errors="coerce").fillna(0)
     result = result[result["stock"] > 0].copy()
     result = result.sort_values(
-        ["deposit_code", "situacion_articulo", "frecuencia_abc", "stock", "part_no"],
+        ["destino_mudanza", "situacion_articulo", "frecuencia_abc", "stock", "part_no"],
         ascending=[True, True, True, False, True],
     ).reset_index(drop=True)
     return result[empty_mudanza_items_df().columns]
-
 
 def load_backorder(uploaded_file) -> pd.DataFrame:
     df = pd.read_excel(uploaded_file)
@@ -2378,9 +2326,6 @@ def init_db():
                 part_no TEXT NOT NULL,
                 description TEXT,
                 stock REAL DEFAULT 0,
-                stock_archivo_situacion REAL DEFAULT 0,
-                diferencia_stock REAL DEFAULT 0,
-                control_stock TEXT,
                 ubicacion TEXT,
                 locacion_nodum TEXT,
                 frecuencia_abc TEXT,
@@ -2392,6 +2337,9 @@ def init_db():
             """
         )
 
+        ensure_column(conn, "mudanza_run_items", "stock_archivo_situacion", "REAL DEFAULT 0")
+        ensure_column(conn, "mudanza_run_items", "diferencia_stock", "REAL DEFAULT 0")
+        ensure_column(conn, "mudanza_run_items", "control_stock", "TEXT")
         ensure_column(conn, "factory_order_batches", "order_code", "TEXT")
         ensure_column(conn, "factory_order_batches", "order_file_hash", "TEXT")
         ensure_column(conn, "factory_order_batches", "file_name", "TEXT")
@@ -2404,9 +2352,6 @@ def init_db():
         ensure_column(conn, "analysis_run_items", "part_key", "TEXT")
         ensure_column(conn, "analysis_run_items", "inventory_quality", "TEXT")
         ensure_column(conn, "analysis_run_items", "no_rotation_3y", "INTEGER DEFAULT 0")
-        ensure_column(conn, "mudanza_run_items", "stock_archivo_situacion", "REAL DEFAULT 0")
-        ensure_column(conn, "mudanza_run_items", "diferencia_stock", "REAL DEFAULT 0")
-        ensure_column(conn, "mudanza_run_items", "control_stock", "TEXT")
         conn.execute("UPDATE factory_order_items SET received_qty = COALESCE(received_qty, 0)")
         conn.execute("UPDATE factory_order_items SET open_qty = COALESCE(open_qty, quantity)")
         conn.execute(
@@ -3373,9 +3318,6 @@ def persist_mudanza_items(conn, run_id: int, items_df: pd.DataFrame):
                 safe_text(row["part_no"]),
                 safe_text(row["description"]),
                 float(row["stock"] or 0),
-                float(row.get("stock_archivo_situacion", 0) or 0),
-                float(row.get("diferencia_stock", 0) or 0),
-                safe_text(row.get("control_stock", "")),
                 safe_text(row["ubicacion"]),
                 safe_text(row["locacion_nodum"]),
                 safe_text(row["frecuencia_abc"]),
@@ -3397,9 +3339,6 @@ def persist_mudanza_items(conn, run_id: int, items_df: pd.DataFrame):
                 part_no,
                 description,
                 stock,
-                stock_archivo_situacion,
-                diferencia_stock,
-                control_stock,
                 ubicacion,
                 locacion_nodum,
                 frecuencia_abc,
@@ -3407,7 +3346,7 @@ def persist_mudanza_items(conn, run_id: int, items_df: pd.DataFrame):
                 situacion_articulo,
                 destino_mudanza
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -3576,9 +3515,6 @@ def load_mudanza_items(run_id: int) -> pd.DataFrame:
                 part_no,
                 description,
                 stock,
-                stock_archivo_situacion,
-                diferencia_stock,
-                control_stock,
                 ubicacion,
                 locacion_nodum,
                 frecuencia_abc,
@@ -4254,6 +4190,7 @@ def build_mudanza_export_df(df: pd.DataFrame) -> pd.DataFrame:
         "ubicacion",
         "locacion_nodum",
         "frecuencia_abc",
+        "situacion_archivo",
         "situacion_articulo",
         "destino_mudanza",
     ]
@@ -4266,133 +4203,120 @@ def build_mudanza_export_df(df: pd.DataFrame) -> pd.DataFrame:
             "deposit_name": "deposito",
             "part_no": "codigo",
             "description": "nombre",
-            "stock": "cantidad_inventario",
+            "stock": "cantidad_inventario_o_archivo",
             "stock_archivo_situacion": "cantidad_archivo_situacion",
             "diferencia_stock": "diferencia_stock",
             "control_stock": "control_stock",
-            "locacion_nodum": "locacion_nodum",
-            "frecuencia_abc": "frecuencia_abc",
-            "situacion_articulo": "situacion",
-            "destino_mudanza": "destino",
-        }
-    )
-
-
-def render_consultar_articulo_tab(analysis_month: str):
-    st.subheader("Consultar articulo")
-    st.caption(
-        "Ingresa un codigo de pieza para ver si figura en Mudanza, si esta marcado como muerto, "
-        "si corresponde devolver a Arrieta/Audistock, o si no aparece en el archivo de situacion."
-    )
-
-    mudanza_df = st.session_state.get(f"mudanza_df_{analysis_month}")
-    if not isinstance(mudanza_df, pd.DataFrame) or mudanza_df.empty:
-        st.info(
-            "Todavia no hay datos de Mudanza cargados para consultar. Carga o revisa la pestana Mudanza "
-            "con el inventario y el archivo Stock MUERTO_ARRIETA."
-        )
-        return
-
-    index_df, lookup = get_consulta_index(analysis_month, mudanza_df)
-    st.caption("Busqueda rapida activada: el indice se arma una sola vez y luego la consulta va directo al codigo/base.")
-
-    form_key = f"consultar_articulo_form_{analysis_month}"
-    last_query_key = f"consultar_articulo_ultima_{analysis_month}"
-    with st.form(form_key, clear_on_submit=False):
-        query = st.text_input(
-            "Codigo de articulo",
-            placeholder="Ej: B631-14-302, B631-14-302A, MDX9-85-0683",
-            key=f"consultar_articulo_codigo_{analysis_month}",
-        )
-        submitted = st.form_submit_button("Consultar", type="primary")
-
-    if submitted:
-        st.session_state[last_query_key] = query
-
-    query_clean = safe_text(st.session_state.get(last_query_key, ""))
-    if not query_clean:
-        st.info(
-            "Escribe un codigo y presiona Consultar. El sistema busca el codigo exacto y tambien variantes Mazda por base, "
-            "por ejemplo B631-14-302 = B631-14-302A = B631-14-302C02."
-        )
-        return
-
-    result_df, match_type, query_display, query_key, query_consulta_key, query_plain_key = search_consulta_index(
-        index_df,
-        lookup,
-        query_clean,
-    )
-
-    if result_df.empty:
-        st.error(f"No encontre el articulo {query_display or query_clean} en la base actual de Mudanza.")
-        st.caption(
-            "Esto significa que no aparecio en el inventario cargado ni en el archivo de situacion usado para esta corrida. "
-            "Tambien se comparan las variantes Mazda por codigo base: por ejemplo "
-            "B631-14-302, B631-14-302A y B631-14-302C02 se consideran el mismo articulo."
-        )
-        return
-
-    if match_type == "partial":
-        st.warning("No hubo coincidencia exacta. Muestro coincidencias parciales por codigo o descripcion.")
-    elif query_consulta_key and query_consulta_key != query_key:
-        st.success(f"Articulo encontrado por codigo base: {query_consulta_key}")
-        st.caption(
-            "Para codigos Mazda se comparan los primeros 11 caracteres del formato 4-2-3. "
-            "Ejemplo: B631-14-302 coincide con B631-14-302A o B631-14-302C02."
-        )
-    else:
-        st.success(f"Articulo encontrado: {query_display or query_clean}")
-
-    total_units = float(pd.to_numeric(result_df["stock"], errors="coerce").fillna(0).sum())
-    situations = ", ".join(sorted({safe_text(v) for v in result_df["situacion_articulo"].tolist() if safe_text(v)})) or "-"
-    deposits = ", ".join(sorted({safe_text(v) for v in result_df["deposit_name"].tolist() if safe_text(v)})) or "-"
-
-    col_1, col_2, col_3 = st.columns(3)
-    col_1.metric("Lineas encontradas", f"{len(result_df):,}")
-    col_2.metric("Unidades", f"{total_units:g}")
-    col_3.metric("Deposito", deposits)
-
-    st.write(f"**Situacion:** {situations}")
-
-    display_df = result_df.rename(
-        columns={
-            "deposit_name": "deposito",
-            "part_no": "codigo",
-            "description": "nombre",
-            "stock": "cantidad_inventario",
-            "stock_archivo_situacion": "cantidad_archivo_situacion",
-            "diferencia_stock": "diferencia_stock",
-            "control_stock": "control_stock",
-            "ubicacion": "ubicacion",
             "locacion_nodum": "locacion_nodum",
             "frecuencia_abc": "frecuencia_abc",
             "situacion_archivo": "marca_en_archivo",
             "situacion_articulo": "situacion",
             "destino_mudanza": "destino",
         }
-    )[
-        [
-            "deposito",
-            "codigo",
-            "nombre",
-            "cantidad_inventario",
-            "cantidad_archivo_situacion",
-            "diferencia_stock",
-            "control_stock",
-            "ubicacion",
-            "locacion_nodum",
-            "frecuencia_abc",
-            "marca_en_archivo",
-            "situacion",
-            "destino",
-        ]
-    ]
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    )
 
+def render_consultar_articulo_tab(analysis_month: str):
+    st.subheader("Consultar artículo")
     st.caption(
-        "SIN STOCK EN ARCHIVO SITUACION = el codigo esta en la base de Mudanza/inventario, "
-        "pero no figura marcado como MUERTO, AUDISTOCK o ARRIETA en la planilla de situacion. "
-        "SIN ABC = no se encontro frecuencia A/B/C en el analisis de ventas cargado."
+        "Ingresá un código para ver si figura en Mudanza. La búsqueda compara exacto, sin guiones "
+        "y variantes Mazda por código base, por ejemplo B631-14-302 = B631-14-302A = B631-14-302C02."
+    )
+
+    mudanza_df = st.session_state.get(f"mudanza_df_{analysis_month}")
+    if not isinstance(mudanza_df, pd.DataFrame) or mudanza_df.empty:
+        st.info("Todavía no hay datos de Mudanza cargados. Primero cargá la pestaña Mudanza.")
+        return
+
+    with st.form(key=f"consulta_form_{analysis_month}"):
+        query = st.text_input("Código de artículo", placeholder="Ej: B631-14-302")
+        submitted = st.form_submit_button("Consultar", type="primary")
+
+    if not submitted:
+        st.caption("Escribí el código y presioná Consultar. No busca mientras escribís, para que sea más rápido.")
+        return
+
+    query_clean = safe_text(query)
+    if not query_clean:
+        st.warning("Ingresá un código para buscar.")
+        return
+
+    query_key = normalize_part_key(query_clean, allow_mazda_compact=True).upper()
+    query_consulta_key = normalize_part_consulta_key(query_clean).upper()
+    query_plain_key = normalize_part_plain_key(query_clean).upper()
+
+    df = mudanza_df.copy()
+    df = ensure_part_identity_columns(df, allow_mazda_compact=True)
+    df["_consulta_key"] = df["part_no"].map(normalize_part_consulta_key).astype(str).str.upper()
+    df["_consulta_key_plain"] = df["_consulta_key"].str.replace("-", "", regex=False).str.upper()
+    df["_part_key_upper"] = df["part_key"].fillna("").astype(str).str.upper()
+    df["_plain_part_no"] = df["part_no"].map(normalize_part_plain_key).astype(str).str.upper()
+    df["_plain_part_key"] = df["part_key"].map(normalize_part_plain_key).astype(str).str.upper()
+
+    matches = df[
+        (df["_part_key_upper"] == query_key)
+        | (df["_consulta_key"] == query_consulta_key)
+        | (df["_consulta_key_plain"] == query_plain_key)
+        | (df["_plain_part_no"] == query_plain_key)
+        | (df["_plain_part_key"] == query_plain_key)
+    ].copy()
+
+    if matches.empty and query_plain_key:
+        matches = df[
+            df["_plain_part_no"].astype(str).str.contains(query_plain_key, na=False)
+            | df["_plain_part_key"].astype(str).str.contains(query_plain_key, na=False)
+            | df["_consulta_key_plain"].astype(str).str.contains(query_plain_key, na=False)
+        ].copy()
+        partial = True
+    else:
+        partial = False
+
+    if matches.empty:
+        st.error(f"No encontré el artículo {query_clean} en la base actual de Mudanza.")
+        st.caption("Revisá guiones, letra final, variantes Mazda o que el archivo correcto esté cargado.")
+        return
+
+    if partial:
+        st.warning("No hubo coincidencia exacta. Muestro coincidencias parciales.")
+    else:
+        st.success(f"Artículo encontrado. Clave base: {query_consulta_key or query_key}")
+
+    metric_1, metric_2, metric_3 = st.columns(3)
+    metric_1.metric("Líneas encontradas", f"{len(matches):,}")
+    metric_2.metric("Unidades", f"{float(pd.to_numeric(matches['stock'], errors='coerce').fillna(0).sum()):,.0f}")
+    metric_3.metric("Destinos", f"{matches['destino_mudanza'].nunique():,}")
+
+    display_cols = [
+        "deposit_name",
+        "part_no",
+        "description",
+        "stock",
+        "stock_archivo_situacion",
+        "frecuencia_abc",
+        "situacion_articulo",
+        "destino_mudanza",
+        "ubicacion",
+        "locacion_nodum",
+        "control_stock",
+    ]
+    for col in display_cols:
+        if col not in matches.columns:
+            matches[col] = ""
+    st.dataframe(
+        matches[display_cols].rename(
+            columns={
+                "deposit_name": "depósito/fuente",
+                "part_no": "código",
+                "description": "descripción",
+                "stock": "cantidad",
+                "stock_archivo_situacion": "cant. archivo",
+                "frecuencia_abc": "frecuencia",
+                "situacion_articulo": "situación",
+                "destino_mudanza": "destino",
+                "ubicacion": "ubicación",
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
     )
 
 
@@ -4408,7 +4332,7 @@ def render_mudanza_tab(
     st.subheader("Mudanza")
     st.caption(
         "Analiza el stock del depósito cargado, cruza ABC y situación del artículo, "
-        "y te deja decidir si cada pieza va al Polo Logístico, queda en Darkinel o se separa para Arrieta."
+        "y propone si cada pieza va a Arrieta, Polo Logístico o Darkinel."
     )
 
     inventory_upload = st.file_uploader(
@@ -4442,17 +4366,23 @@ def render_mudanza_tab(
         hide_index=True,
     )
     st.caption(
-        "Situacion usa la columna Comentario del archivo Stock MUERTO_ARRIETA: AUDISTOCK = DEVOLVER - ARRIETA; "
-        "STOCK MUERTO con frecuencia A/B/C se mantiene segun el analisis. "
-        "Si es SERVICE queda en Darkinel; si es CARROCERIA va a Polo Logistico. "
-        "STOCK MUERTO sin frecuencia A/B/C queda como APARTAR - STOCK MUERTO PARA DEVOLVER. "
-        "Control stock compara la cantidad del inventario cargado contra la columna stock de esa planilla."
+        "Regla: AUDISTOCK se separa para Arrieta. Si dice STOCK MUERTO pero el análisis da frecuencia A/B/C, "
+        "se saca de muerto y se clasifica: CARROCERÍA va al Polo Logístico; SERVICE queda en Darkinel. "
+        "Si dice STOCK MUERTO y no tiene frecuencia A/B/C, queda como APARTAR - STOCK MUERTO PARA DEVOLVER."
     )
 
     inventory_frames = []
+    inventory_warning = ""
     try:
         if inventory_file is not None:
-            inventory_frames.append(load_mudanza_inventory(inventory_file, fallback_deposit_code="DEPOSITO"))
+            inv_df = load_mudanza_inventory(inventory_file, fallback_deposit_code="DEPOSITO")
+            if inv_df.empty:
+                inventory_warning = (
+                    "El archivo cargado como inventario no parece tener el formato de inventario esperado. "
+                    "La app igual mostrará los artículos del archivo de situación si están cargados."
+                )
+            else:
+                inventory_frames.append(inv_df)
         status_df = load_mudanza_status(status_file) if status_file is not None else pd.DataFrame()
         previous_decisions_df = load_latest_mudanza_decisions(empresa)
         mudanza_df = build_mudanza_dataset(
@@ -4463,197 +4393,188 @@ def render_mudanza_tab(
         )
         st.session_state[f"mudanza_df_{analysis_month}"] = mudanza_df.copy()
     except Exception as exc:
-        st.error(f"No se pudo preparar la pestana de mudanza: {exc}")
+        st.error(f"No se pudo preparar la pestaña de mudanza: {exc}")
         return
+
+    if inventory_warning:
+        st.warning(inventory_warning)
 
     if mudanza_df.empty:
         st.info(
-            "Carga el inventario del depósito a analizar con stock positivo para trabajar la mudanza. "
-            "El archivo de situación es opcional, pero recomendado."
+            "Carga el archivo de situación Stock MUERTO_ARRIETA y/o el inventario del depósito a analizar. "
+            "Con el archivo de situación alcanza para listar AUDISTOCK y STOCK MUERTO."
         )
-    else:
-        metric_1, metric_2, metric_3, metric_4, metric_5 = st.columns(5)
-        metric_1.metric("Articulos en mudanza", f"{len(mudanza_df):,}")
-        metric_2.metric("Unid. inventario", f"{int(mudanza_df['stock'].sum()):,}")
-        metric_3.metric("Unid. archivo situacion", f"{int(pd.to_numeric(mudanza_df.get('stock_archivo_situacion', 0), errors='coerce').fillna(0).sum()):,}")
-        metric_4.metric("Con ABC", f"{int(mudanza_df['frecuencia_abc'].isin(['A', 'B', 'C']).sum()):,}")
-        metric_5.metric(
-            "Diferencias stock",
-            f"{int(mudanza_df['control_stock'].astype(str).str.contains('DIFERENCIA', na=False).sum()):,}",
-        )
-
-        summary_col_1, summary_col_2 = st.columns(2)
-        summary_col_1.caption("Resumen por deposito")
-        summary_col_1.dataframe(
-            mudanza_df.groupby(["deposit_code", "deposit_name"], as_index=False)
-            .agg(
-                articulos=("part_no", "count"),
-                unidades_inventario=("stock", "sum"),
-                unidades_archivo_situacion=("stock_archivo_situacion", "sum"),
-            )
-            .sort_values(["deposit_code", "deposit_name"]),
-            use_container_width=True,
-            hide_index=True,
-        )
-        summary_col_2.caption("Resumen por situacion")
-        summary_col_2.dataframe(
-            mudanza_df.groupby("situacion_articulo", as_index=False)
-            .agg(articulos=("part_no", "count"), unidades=("stock", "sum"))
-            .sort_values(["situacion_articulo"]),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.caption("Control de cantidades: compara stock inventario contra stock del archivo Stock MUERTO_ARRIETA")
-        st.dataframe(
-            mudanza_df.groupby("control_stock", as_index=False)
-            .agg(
-                articulos=("part_no", "count"),
-                unidades_inventario=("stock", "sum"),
-                unidades_archivo_situacion=("stock_archivo_situacion", "sum"),
-                diferencia_total=("diferencia_stock", "sum"),
-            )
-            .sort_values(["control_stock"]),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.caption("Define el destino para cada articulo. Si ya habia una decision guardada, se precarga automaticamente.")
-        editor_source_df = mudanza_df.reset_index(drop=True).copy()
-        editor_display_df = pd.DataFrame(
-            {
-                "Deposito": editor_source_df["deposit_name"],
-                "Codigo": editor_source_df["part_no"],
-                "Nombre": editor_source_df["description"],
-                "Cant. inventario": editor_source_df["stock"],
-                "Cant. archivo": editor_source_df["stock_archivo_situacion"],
-                "Dif. stock": editor_source_df["diferencia_stock"],
-                "Control stock": editor_source_df["control_stock"],
-                "Ubicacion": editor_source_df["ubicacion"],
-                "Frecuencia": editor_source_df["frecuencia_abc"],
-                "Situacion": editor_source_df["situacion_articulo"],
-                "Destino": editor_source_df["destino_mudanza"],
-            }
-        )
-        edited_display_df = st.data_editor(
-            editor_display_df,
-            hide_index=True,
-            use_container_width=True,
-            height=460,
-            key=f"mudanza_editor_{analysis_month}",
-            column_config={
-                "Cant. inventario": st.column_config.NumberColumn("Cant. inventario", format="%.0f", disabled=True),
-                "Cant. archivo": st.column_config.NumberColumn("Cant. archivo", format="%.0f", disabled=True),
-                "Dif. stock": st.column_config.NumberColumn("Dif. stock", format="%.0f", disabled=True),
-                "Destino": st.column_config.SelectboxColumn("Destino", options=MUDANZA_DESTINATIONS, required=True),
-            },
-            disabled=[
-                "Deposito",
-                "Codigo",
-                "Nombre",
-                "Cant. inventario",
-                "Cant. archivo",
-                "Dif. stock",
-                "Control stock",
-                "Ubicacion",
-                "Frecuencia",
-                "Situacion",
-            ],
-        )
-
-        edited_mudanza_df = editor_source_df.copy()
-        edited_mudanza_df["destino_mudanza"] = edited_display_df["Destino"].fillna("Pendiente").astype(str).str.strip()
-        edited_mudanza_df.loc[
-            ~edited_mudanza_df["destino_mudanza"].isin(MUDANZA_DESTINATIONS), "destino_mudanza"
-        ] = "Pendiente"
-
-        pending_df = edited_mudanza_df[edited_mudanza_df["destino_mudanza"] == "Pendiente"].copy()
-        polo_df = edited_mudanza_df[edited_mudanza_df["destino_mudanza"] == "Polo Logistico"].copy()
-        darkinel_df = edited_mudanza_df[edited_mudanza_df["destino_mudanza"] == "Darkinel"].copy()
-
-        action_col_1, action_col_2, action_col_3 = st.columns([1, 1, 2])
-        action_col_1.metric("Unidades a Polo", f"{int(polo_df['stock'].sum()):,}")
-        action_col_2.metric("Unidades en Darkinel", f"{int(darkinel_df['stock'].sum()):,}")
-        if action_col_3.button("Guardar decision de mudanza", type="primary", key=f"save_mudanza_{analysis_month}"):
-            try:
-                result = save_mudanza_run(
-                    empresa=empresa,
-                    analysis_date=analysis_date,
-                    inventory_d012_file=inventory_d012_file,
-                    inventory_d122_file=inventory_d122_file,
-                    status_file=status_file,
-                    items_df=edited_mudanza_df,
-                    notes=default_note,
-                )
-                st.session_state["mudanza_feedback"] = result
-                st.rerun()
-            except Exception as exc:
-                st.session_state["mudanza_feedback"] = {
-                    "status": "error",
-                    "message": f"No se pudo guardar la mudanza: {exc}",
-                }
-                st.rerun()
-
-        list_col_1, list_col_2 = st.columns(2)
-        export_polo_df = build_mudanza_export_df(polo_df)
-        export_darkinel_df = build_mudanza_export_df(darkinel_df)
-
-        list_col_1.subheader("A Polo Logistico")
-        if export_polo_df.empty:
-            list_col_1.info("Todavia no hay articulos asignados al Polo Logistico.")
-        else:
-            list_col_1.dataframe(export_polo_df, use_container_width=True, height=320, hide_index=True)
-            list_col_1.download_button(
-                "Descargar Polo Logistico",
-                data=dataframe_to_excel_bytes(export_polo_df, sheet_name="Polo Logistico"),
-                file_name=f"mudanza_polo_logistico_{analysis_month}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"download_mudanza_polo_{analysis_month}",
-            )
-
-        list_col_2.subheader("Se queda en Darkinel")
-        if export_darkinel_df.empty:
-            list_col_2.info("Todavia no hay articulos marcados para quedarse en Darkinel.")
-        else:
-            list_col_2.dataframe(export_darkinel_df, use_container_width=True, height=320, hide_index=True)
-            list_col_2.download_button(
-                "Descargar Darkinel",
-                data=dataframe_to_excel_bytes(export_darkinel_df, sheet_name="Darkinel"),
-                file_name=f"mudanza_darkinel_{analysis_month}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"download_mudanza_darkinel_{analysis_month}",
-            )
-
-        st.subheader("Pendientes de definir")
-        if pending_df.empty:
-            st.success("Todos los articulos del listado ya tienen destino asignado.")
-        else:
-            st.dataframe(build_mudanza_export_df(pending_df), use_container_width=True, height=240, hide_index=True)
-
-    st.subheader("Historial guardado de mudanza")
-    mudanza_history_df = load_recent_mudanza_runs(empresa)
-    if mudanza_history_df.empty:
-        st.info("Todavia no hay decisiones de mudanza guardadas para esta empresa.")
         return
 
-    st.dataframe(mudanza_history_df, use_container_width=True, height=260, hide_index=True)
-    history_labels = [
-        f"#{int(row['mudanza_id'])} - {row['mes_analisis']} - {row['fecha_carga']}"
-        for _, row in mudanza_history_df.iterrows()
-    ]
-    selected_history_label = st.selectbox(
-        "Ver snapshot guardado de mudanza",
-        history_labels,
-        key=f"mudanza_history_selector_{analysis_month}",
-    )
-    selected_history_index = history_labels.index(selected_history_label)
-    selected_history_id = int(mudanza_history_df.iloc[selected_history_index]["mudanza_id"])
-    saved_mudanza_df = load_mudanza_items(selected_history_id)
-    if saved_mudanza_df.empty:
-        st.info("La snapshot seleccionada no tiene articulos guardados.")
-    else:
-        st.dataframe(build_mudanza_export_df(saved_mudanza_df), use_container_width=True, height=320, hide_index=True)
+    metric_1, metric_2, metric_3, metric_4, metric_5 = st.columns(5)
+    metric_1.metric("Artículos", f"{len(mudanza_df):,}")
+    metric_2.metric("Unid. inventario/app", f"{float(mudanza_df['stock'].sum()):,.0f}")
+    metric_3.metric("Unid. archivo situación", f"{float(pd.to_numeric(mudanza_df.get('stock_archivo_situacion', 0), errors='coerce').fillna(0).sum()):,.0f}")
+    metric_4.metric("Con ABC A/B/C", f"{int(mudanza_df['frecuencia_abc'].isin(['A', 'B', 'C']).sum()):,}")
+    metric_5.metric("Diferencias stock", f"{int(mudanza_df['control_stock'].astype(str).str.contains('DIFERENCIA', na=False).sum()):,}")
 
+    summary_col_1, summary_col_2 = st.columns(2)
+    summary_col_1.caption("Resumen por destino")
+    summary_col_1.dataframe(
+        mudanza_df.groupby("destino_mudanza", as_index=False)
+        .agg(articulos=("part_no", "count"), unidades=("stock", "sum"))
+        .sort_values(["destino_mudanza"]),
+        use_container_width=True,
+        hide_index=True,
+    )
+    summary_col_2.caption("Resumen por situación")
+    summary_col_2.dataframe(
+        mudanza_df.groupby("situacion_articulo", as_index=False)
+        .agg(
+            articulos=("part_no", "count"),
+            unidades=("stock", "sum"),
+            unidades_archivo_situacion=("stock_archivo_situacion", "sum"),
+        )
+        .sort_values(["situacion_articulo"]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    def show_subset(title: str, mask, empty_text: str):
+        subset = mudanza_df.loc[mask].copy()
+        st.markdown(f"### {title}")
+        if subset.empty:
+            st.info(empty_text)
+            return
+        st.dataframe(
+            subset[
+                [
+                    "part_no",
+                    "description",
+                    "stock",
+                    "stock_archivo_situacion",
+                    "frecuencia_abc",
+                    "situacion_articulo",
+                    "destino_mudanza",
+                    "ubicacion",
+                    "locacion_nodum",
+                    "control_stock",
+                ]
+            ].rename(
+                columns={
+                    "part_no": "código",
+                    "description": "descripción",
+                    "stock": "cantidad",
+                    "stock_archivo_situacion": "cant. archivo",
+                    "frecuencia_abc": "frecuencia",
+                    "situacion_articulo": "situación",
+                    "destino_mudanza": "destino",
+                    "ubicacion": "ubicación",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+            height=280,
+        )
+
+    show_subset(
+        "Audistock / Arrieta",
+        mudanza_df["situacion_articulo"].astype(str).str.upper().eq("DEVOLVER - ARRIETA"),
+        "No hay artículos AUDISTOCK/ARRIETA en esta corrida.",
+    )
+    show_subset(
+        "Stock muerto que se saca de muerto por frecuencia A/B/C",
+        mudanza_df["situacion_articulo"].astype(str).str.upper().str.startswith("FRECUENCIA "),
+        "No hay artículos STOCK MUERTO con frecuencia A/B/C en esta corrida.",
+    )
+
+    st.caption("Control de cantidades: compara stock inventario contra stock del archivo Stock MUERTO_ARRIETA.")
+    st.dataframe(
+        mudanza_df.groupby("control_stock", as_index=False)
+        .agg(
+            articulos=("part_no", "count"),
+            unidades_inventario_o_archivo=("stock", "sum"),
+            unidades_archivo_situacion=("stock_archivo_situacion", "sum"),
+            diferencia_total=("diferencia_stock", "sum"),
+        )
+        .sort_values(["control_stock"]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.caption("Define o corrige el destino para cada artículo. Si ya había una decisión guardada, se precarga automáticamente.")
+    editor_source_df = mudanza_df.reset_index(drop=True).copy()
+    editor_display_df = pd.DataFrame(
+        {
+            "Depósito/Fuente": editor_source_df["deposit_name"],
+            "Código": editor_source_df["part_no"],
+            "Nombre": editor_source_df["description"],
+            "Cant. inventario/app": editor_source_df["stock"],
+            "Cant. archivo": editor_source_df["stock_archivo_situacion"],
+            "Dif. stock": editor_source_df["diferencia_stock"],
+            "Control stock": editor_source_df["control_stock"],
+            "Ubicación": editor_source_df["ubicacion"],
+            "Locación NODUM": editor_source_df["locacion_nodum"],
+            "Frecuencia": editor_source_df["frecuencia_abc"],
+            "Situación": editor_source_df["situacion_articulo"],
+            "Destino": editor_source_df["destino_mudanza"],
+        }
+    )
+    edited_display_df = st.data_editor(
+        editor_display_df,
+        hide_index=True,
+        use_container_width=True,
+        height=520,
+        key=f"mudanza_editor_{analysis_month}",
+        column_config={
+            "Cant. inventario/app": st.column_config.NumberColumn("Cant. inventario/app", format="%.0f", disabled=True),
+            "Cant. archivo": st.column_config.NumberColumn("Cant. archivo", format="%.0f", disabled=True),
+            "Dif. stock": st.column_config.NumberColumn("Dif. stock", format="%.0f", disabled=True),
+            "Destino": st.column_config.SelectboxColumn("Destino", options=MUDANZA_DESTINATIONS, required=True),
+        },
+        disabled=[
+            "Depósito/Fuente",
+            "Código",
+            "Nombre",
+            "Cant. inventario/app",
+            "Cant. archivo",
+            "Dif. stock",
+            "Control stock",
+            "Ubicación",
+            "Locación NODUM",
+            "Frecuencia",
+            "Situación",
+        ],
+    )
+
+    edited_mudanza_df = editor_source_df.copy()
+    edited_mudanza_df["destino_mudanza"] = edited_display_df["Destino"].fillna("Pendiente").astype(str).str.strip()
+    edited_mudanza_df.loc[~edited_mudanza_df["destino_mudanza"].isin(MUDANZA_DESTINATIONS), "destino_mudanza"] = "Pendiente"
+    st.session_state[f"mudanza_df_{analysis_month}"] = edited_mudanza_df.copy()
+
+    export_df = build_mudanza_export_df(edited_mudanza_df)
+    st.download_button(
+        "Descargar Excel mudanza",
+        data=dataframe_to_excel_bytes(export_df, sheet_name="Mudanza"),
+        file_name=f"mudanza_{empresa}_{analysis_month}.xlsx".replace(" ", "_"),
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    save_col_1, save_col_2 = st.columns([1, 3])
+    with save_col_1:
+        if st.button("Guardar corrida de mudanza", type="primary", key=f"save_mudanza_{analysis_month}"):
+            feedback = save_mudanza_run(
+                empresa=empresa,
+                analysis_date=analysis_date,
+                inventory_d012_file=inventory_file,
+                inventory_d122_file=None,
+                status_file=status_file,
+                items_df=edited_mudanza_df,
+            )
+            st.session_state["mudanza_feedback"] = feedback
+            st.rerun()
+    with save_col_2:
+        st.caption("Guarda la corrida para conservar las decisiones de destino y reutilizarlas en próximas cargas.")
+
+    recent_runs = load_recent_mudanza_runs(empresa)
+    if not recent_runs.empty:
+        st.subheader("Historial guardado de mudanza")
+        st.dataframe(recent_runs, use_container_width=True, hide_index=True)
 
 def render_saved_factory_orders(empresa: str):
     st.subheader("Pedidos a fabrica guardados en base")
@@ -5427,7 +5348,7 @@ def main():
     final_df = pd.DataFrame(columns=["part_no", "description", "abc", "status"])
     inventario_file_for_mudanza = detected_sources.get("inventario")
 
-    pedido_tab, mudanza_tab, consulta_tab = st.tabs(["Pedido", "Mudanza", "Consultar articulo"])
+    pedido_tab, mudanza_tab, consulta_tab = st.tabs(["Pedido", "Mudanza", "Consultar artículo"])
 
     with pedido_tab:
         st.info(
@@ -5657,7 +5578,7 @@ def main():
                 )
 
     with mudanza_tab:
-        # Si Pedido no se pudo calcular, Mudanza trabaja igual; en Frecuencia/ABC mostrara SIN ABC.
+        # Si Pedido no se pudo calcular, Mudanza trabaja igual; en Frecuencia/ABC mostrara NO ESTA.
         if not isinstance(final_df, pd.DataFrame) or final_df.empty:
             final_df = pd.DataFrame(columns=["part_no", "description", "abc", "status"])
 
