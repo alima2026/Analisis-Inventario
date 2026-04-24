@@ -4747,7 +4747,7 @@ def main():
     init_db()
 
     st.title("Pedidos Magna")
-    st.caption("Analisis de inventario, pedidos y seguimiento historico en SQLite")
+    st.caption("Analisis de inventario, pedidos, seguimiento historico y mudanza en SQLite")
     render_save_feedback()
     render_order_import_feedback()
 
@@ -4760,7 +4760,7 @@ def main():
         if st.button("Continuar"):
             st.session_state.empresa_seleccionada = empresa_inicio
             st.rerun()
-        st.stop()
+        return
 
     empresa_activa = st.session_state.empresa_seleccionada
 
@@ -4790,204 +4790,253 @@ def main():
     analysis_month = get_analysis_month(analysis_date)
     rolling_start, rolling_end = get_rolling_window(analysis_date)
 
-    st.info(
-        f"Ventana base declarada para ventas 3 anios: {rolling_start.strftime('%Y-%m')} a {rolling_end.strftime('%Y-%m')}."
-    )
-
-    st.subheader("Fuentes detectadas en carpeta")
-    detected_rows = []
-    for label, key in [
-        ("Ventas 3 anios", "ventas"),
-        ("Inventario", "inventario"),
-        ("Backorder", "backorder"),
-        ("Pedido a fabrica", "pedido_fabrica"),
-    ]:
-        source = detected_sources.get(key)
-        detected_rows.append(
-            {
-                "tipo": label,
-                "archivo": source.name if source else "No encontrado",
-                "ruta": str(source.path) if source else "",
-            }
-        )
-    st.dataframe(pd.DataFrame(detected_rows), use_container_width=True, hide_index=True)
-
-    st.subheader("Opcional: reemplazar archivos detectados")
-    upload_col_1, upload_col_2 = st.columns(2)
-    ventas_upload = upload_col_1.file_uploader("Ventas 3 anios", type=["xls", "xlsx"])
-    inventario_upload = upload_col_2.file_uploader("Inventario", type=["xls", "xlsx"])
-    upload_col_3, upload_col_4 = st.columns(2)
-    backorder_upload = upload_col_3.file_uploader("Backorder", type=["xls", "xlsx"])
-    pedido_upload = upload_col_4.file_uploader("Pedido a fabrica", type=["xls", "xlsx"])
-
-    ventas_file = resolve_source_file(ventas_upload, detected_sources["ventas"])
-    inventario_file = resolve_source_file(inventario_upload, detected_sources["inventario"])
-    backorder_file = resolve_source_file(backorder_upload, detected_sources["backorder"])
-    pedido_file = resolve_source_file(pedido_upload, detected_sources["pedido_fabrica"])
-
-    render_order_database_import_section(
-        empresa=empresa_activa,
-        analysis_month=analysis_month,
-        pedido_file=pedido_file,
-        default_note=save_note,
-    )
-    render_history_sections(empresa_activa, analysis_month)
-
-    if not all([ventas_file, inventario_file, backorder_file]):
-        st.info("Para calcular el pedido a solicitar necesitas cargar Ventas 3 anios, Inventario y Backorder. El Pedido a fabrica es opcional.")
-        st.stop()
-
-    source_hash = build_source_hash(
-        empresa_activa,
-        analysis_month,
-        target_months,
-        lead_time_months,
-        capital_available,
-        ventas_file,
-        inventario_file,
-        backorder_file,
-        pedido_file,
-    )
-    order_file_hash = build_file_hash(pedido_file) if pedido_file is not None else ""
-    open_orders_df = load_open_factory_orders_by_part(
-        empresa_activa,
-        exclude_order_file_hash=order_file_hash if order_file_hash else None,
-    )
-
-    try:
-        sales_df = load_sales(ventas_file)
-        stock_df = load_inventory(inventario_file)
-        backorder_df = load_backorder(backorder_file)
-        order_df = load_monthly_order(pedido_file, default_analysis_month=analysis_month) if pedido_file is not None else empty_monthly_order()
-
-        final_df = build_analysis_dataframe(
-            sales_df=sales_df,
-            stock_df=stock_df,
-            backorder_df=backorder_df,
-            order_df=order_df,
-            open_orders_df=open_orders_df,
-            target_months=target_months,
-            lead_time_months=lead_time_months,
-            capital_available=capital_available,
-            empresa=empresa_activa,
-        )
-        final_df, baseline = add_historical_context(
-            current_df=final_df,
-            empresa=empresa_activa,
-            analysis_date=analysis_date,
-            current_source_hash=source_hash,
-        )
-        code_unification_report = collect_code_unification_reports(backorder_df, order_df)
-        formatted_code_count = count_formatted_codes(backorder_df, order_df)
-    except Exception as exc:
-        st.error(f"Error procesando archivos: {exc}")
-        st.stop()
-
-    month_order_summary = load_month_order_summary(empresa_activa, analysis_month)
-    current_order_qty = float(pd.to_numeric(order_df.get("monthly_order_qty", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
-    current_order_lines = int(
-        (pd.to_numeric(order_df.get("monthly_order_qty", pd.Series(dtype=float)), errors="coerce").fillna(0) > 0).sum()
-    )
-    current_order_batches = int(order_df.attrs.get("order_count", 1) or 1)
-    if month_order_summary["pedidos"] > 0:
-        message = f"En {analysis_month} ya hay {month_order_summary['pedidos']} pedido(s) registrados en base"
-        if month_order_summary["qty_total"] > 0 or month_order_summary["qty_abierta"] > 0:
-            message += (
-                f", {_format_qty(month_order_summary['qty_total'])} pcs totales y "
-                f"{_format_qty(month_order_summary['qty_abierta'])} pcs abiertas."
-            )
-        elif month_order_summary["lineas"] > 0:
-            message += f", con {month_order_summary['lineas']} linea(s) registradas."
-        else:
-            message += "."
-        if month_order_summary["ultimo_pedido"]:
-            message += f" Ultimo pedido: {month_order_summary['ultimo_pedido']}."
-        st.success(message)
-        if current_order_qty > 0:
-            st.caption(
-                f"El archivo de pedido actual trae {current_order_lines} codigo(s) y {_format_qty(current_order_qty)} pcs."
-            )
-    elif current_order_qty > 0:
-        st.info(
-            f"En {analysis_month} aun no hay pedidos guardados en base, pero el archivo actual trae "
-            f"{current_order_lines} codigo(s) y {_format_qty(current_order_qty)} pcs."
-        )
-        st.caption("Al guardar la corrida, ese pedido tambien queda registrado en la base.")
-    else:
-        st.info(f"En {analysis_month} no hay pedidos registrados en base.")
-
-    if pedido_file is not None and current_order_batches > 1:
-        st.info(
-            f"El archivo de pedido actual contiene {current_order_batches} pedidos distintos. "
-            "Para generar la base historica completa usa el bloque 'Generar base de datos de pedidos'."
-        )
-
-    if formatted_code_count:
-        st.info(
-            f"Se normalizaron {formatted_code_count} codigos de Backorder/Pedido a fabrica "
-            "con guiones o letras de modificacion."
-        )
-
-    if not code_unification_report.empty:
-        st.warning(
-            "Se detectaron codigos equivalentes con distinta letra de modificacion. "
-            "El sistema sumo las cantidades y dejo la letra mas nueva."
-        )
-        st.dataframe(code_unification_report, use_container_width=True, hide_index=True)
-
-    action_col_1, action_col_2 = st.columns([2, 5])
-    if action_col_1.button("Guardar corrida en base", type="primary"):
-        try:
-            result = save_analysis_run(
-                empresa=empresa_activa,
-                analysis_date=analysis_date,
-                target_months=target_months,
-                lead_time_months=lead_time_months,
-                capital_available=capital_available,
-                ventas_file=ventas_file,
-                inventario_file=inventario_file,
-                backorder_file=backorder_file,
-                pedido_file=pedido_file,
-                sales_df=sales_df,
-                stock_df=stock_df,
-                backorder_df=backorder_df,
-                order_df=order_df,
-                final_df=final_df,
-                source_hash=source_hash,
-                order_file_hash=order_file_hash,
-                register_current_order=pedido_file is not None and not order_df.empty and int(order_df.attrs.get("order_count", 1) or 1) == 1,
-                notes=save_note,
-            )
-            st.session_state["save_feedback"] = result
-            st.rerun()
-        except Exception as exc:
-            st.session_state["save_feedback"] = {
-                "status": "error",
-                "message": f"No se pudo guardar la corrida: {exc}",
-            }
-            st.rerun()
+    # Estas variables se completan si el analisis de Pedido logra procesar.
+    # Mudanza NO debe quedar bloqueada si faltan Ventas/Backorder.
+    final_df = pd.DataFrame(columns=["part_no", "description", "abc", "status"])
+    inventario_file_for_mudanza = detected_sources.get("inventario")
 
     pedido_tab, mudanza_tab = st.tabs(["Pedido", "Mudanza"])
+
     with pedido_tab:
-        render_pedido_tab(
-            empresa_activa=empresa_activa,
-            analysis_month=analysis_month,
-            final_df=final_df,
-            baseline=baseline,
-            code_unification_report=code_unification_report,
-            top_n=top_n,
-            save_note=save_note,
+        st.info(
+            f"Ventana base declarada para ventas 3 anios: "
+            f"{rolling_start.strftime('%Y-%m')} a {rolling_end.strftime('%Y-%m')}."
         )
+
+        st.subheader("Fuentes detectadas en carpeta")
+        detected_rows = []
+        for label, key in [
+            ("Ventas 3 anios", "ventas"),
+            ("Inventario", "inventario"),
+            ("Backorder", "backorder"),
+            ("Pedido a fabrica", "pedido_fabrica"),
+        ]:
+            source = detected_sources.get(key)
+            detected_rows.append(
+                {
+                    "tipo": label,
+                    "archivo": source.name if source else "No encontrado",
+                    "ruta": str(source.path) if source else "",
+                }
+            )
+        st.dataframe(pd.DataFrame(detected_rows), use_container_width=True, hide_index=True)
+
+        st.subheader("Opcional: reemplazar archivos detectados")
+        upload_col_1, upload_col_2 = st.columns(2)
+        ventas_upload = upload_col_1.file_uploader("Ventas 3 anios", type=["xls", "xlsx"])
+        inventario_upload = upload_col_2.file_uploader("Inventario", type=["xls", "xlsx"])
+        upload_col_3, upload_col_4 = st.columns(2)
+        backorder_upload = upload_col_3.file_uploader("Backorder", type=["xls", "xlsx"])
+        pedido_upload = upload_col_4.file_uploader("Pedido a fabrica", type=["xls", "xlsx"])
+
+        ventas_file = resolve_source_file(ventas_upload, detected_sources["ventas"])
+        inventario_file = resolve_source_file(inventario_upload, detected_sources["inventario"])
+        backorder_file = resolve_source_file(backorder_upload, detected_sources["backorder"])
+        pedido_file = resolve_source_file(pedido_upload, detected_sources["pedido_fabrica"])
+
+        # Deja disponible el inventario para la pestana Mudanza aunque no se pueda calcular Pedido.
+        inventario_file_for_mudanza = inventario_file
+
+        render_order_database_import_section(
+            empresa=empresa_activa,
+            analysis_month=analysis_month,
+            pedido_file=pedido_file,
+            default_note=save_note,
+        )
+        render_history_sections(empresa_activa, analysis_month)
+
+        missing_sources = []
+        if ventas_file is None:
+            missing_sources.append("Ventas 3 anios")
+        if inventario_file is None:
+            missing_sources.append("Inventario")
+        if backorder_file is None:
+            missing_sources.append("Backorder")
+
+        if missing_sources:
+            st.warning(
+                "Para calcular el pedido a solicitar faltan: "
+                + ", ".join(missing_sources)
+                + ". El Pedido a fabrica es opcional. La pestana Mudanza sigue funcionando."
+            )
+        else:
+            try:
+                source_hash = build_source_hash(
+                    empresa_activa,
+                    analysis_month,
+                    target_months,
+                    lead_time_months,
+                    capital_available,
+                    ventas_file,
+                    inventario_file,
+                    backorder_file,
+                    pedido_file,
+                )
+                order_file_hash = build_file_hash(pedido_file) if pedido_file is not None else ""
+                open_orders_df = load_open_factory_orders_by_part(
+                    empresa_activa,
+                    exclude_order_file_hash=order_file_hash if order_file_hash else None,
+                )
+
+                sales_df = load_sales(ventas_file)
+                stock_df = load_inventory(inventario_file)
+                backorder_df = load_backorder(backorder_file)
+                order_df = (
+                    load_monthly_order(pedido_file, default_analysis_month=analysis_month)
+                    if pedido_file is not None
+                    else empty_monthly_order()
+                )
+
+                final_df = build_analysis_dataframe(
+                    sales_df=sales_df,
+                    stock_df=stock_df,
+                    backorder_df=backorder_df,
+                    order_df=order_df,
+                    open_orders_df=open_orders_df,
+                    target_months=target_months,
+                    lead_time_months=lead_time_months,
+                    capital_available=capital_available,
+                    empresa=empresa_activa,
+                )
+                final_df, baseline = add_historical_context(
+                    current_df=final_df,
+                    empresa=empresa_activa,
+                    analysis_date=analysis_date,
+                    current_source_hash=source_hash,
+                )
+                code_unification_report = collect_code_unification_reports(backorder_df, order_df)
+                formatted_code_count = count_formatted_codes(backorder_df, order_df)
+
+                month_order_summary = load_month_order_summary(empresa_activa, analysis_month)
+                current_order_qty = float(
+                    pd.to_numeric(
+                        order_df.get("monthly_order_qty", pd.Series(dtype=float)),
+                        errors="coerce",
+                    ).fillna(0).sum()
+                )
+                current_order_lines = int(
+                    (
+                        pd.to_numeric(
+                            order_df.get("monthly_order_qty", pd.Series(dtype=float)),
+                            errors="coerce",
+                        ).fillna(0) > 0
+                    ).sum()
+                )
+                current_order_batches = int(order_df.attrs.get("order_count", 1) or 1)
+
+                if month_order_summary["pedidos"] > 0:
+                    message = f"En {analysis_month} ya hay {month_order_summary['pedidos']} pedido(s) registrados en base"
+                    if month_order_summary["qty_total"] > 0 or month_order_summary["qty_abierta"] > 0:
+                        message += (
+                            f", {_format_qty(month_order_summary['qty_total'])} pcs totales y "
+                            f"{_format_qty(month_order_summary['qty_abierta'])} pcs abiertas."
+                        )
+                    elif month_order_summary["lineas"] > 0:
+                        message += f", con {month_order_summary['lineas']} linea(s) registradas."
+                    else:
+                        message += "."
+                    if month_order_summary["ultimo_pedido"]:
+                        message += f" Ultimo pedido: {month_order_summary['ultimo_pedido']}."
+                    st.success(message)
+                    if current_order_qty > 0:
+                        st.caption(
+                            f"El archivo de pedido actual trae {current_order_lines} codigo(s) "
+                            f"y {_format_qty(current_order_qty)} pcs."
+                        )
+                elif current_order_qty > 0:
+                    st.info(
+                        f"En {analysis_month} aun no hay pedidos guardados en base, pero el archivo actual trae "
+                        f"{current_order_lines} codigo(s) y {_format_qty(current_order_qty)} pcs."
+                    )
+                    st.caption("Al guardar la corrida, ese pedido tambien queda registrado en la base.")
+                else:
+                    st.info(f"En {analysis_month} no hay pedidos registrados en base.")
+
+                if pedido_file is not None and current_order_batches > 1:
+                    st.info(
+                        f"El archivo de pedido actual contiene {current_order_batches} pedidos distintos. "
+                        "Para generar la base historica completa usa el bloque 'Generar base de datos de pedidos'."
+                    )
+
+                if formatted_code_count:
+                    st.info(
+                        f"Se normalizaron {formatted_code_count} codigos de Backorder/Pedido a fabrica "
+                        "con guiones o letras de modificacion."
+                    )
+
+                if not code_unification_report.empty:
+                    st.warning(
+                        "Se detectaron codigos equivalentes con distinta letra de modificacion. "
+                        "El sistema sumo las cantidades y dejo la letra mas nueva."
+                    )
+                    st.dataframe(code_unification_report, use_container_width=True, hide_index=True)
+
+                action_col_1, action_col_2 = st.columns([2, 5])
+                if action_col_1.button("Guardar corrida en base", type="primary"):
+                    try:
+                        result = save_analysis_run(
+                            empresa=empresa_activa,
+                            analysis_date=analysis_date,
+                            target_months=target_months,
+                            lead_time_months=lead_time_months,
+                            capital_available=capital_available,
+                            ventas_file=ventas_file,
+                            inventario_file=inventario_file,
+                            backorder_file=backorder_file,
+                            pedido_file=pedido_file,
+                            sales_df=sales_df,
+                            stock_df=stock_df,
+                            backorder_df=backorder_df,
+                            order_df=order_df,
+                            final_df=final_df,
+                            source_hash=source_hash,
+                            order_file_hash=order_file_hash,
+                            register_current_order=(
+                                pedido_file is not None
+                                and not order_df.empty
+                                and int(order_df.attrs.get("order_count", 1) or 1) == 1
+                            ),
+                            notes=save_note,
+                        )
+                        st.session_state["save_feedback"] = result
+                        st.rerun()
+                    except Exception as exc:
+                        st.session_state["save_feedback"] = {
+                            "status": "error",
+                            "message": f"No se pudo guardar la corrida: {exc}",
+                        }
+                        st.rerun()
+
+                render_pedido_tab(
+                    empresa_activa=empresa_activa,
+                    analysis_month=analysis_month,
+                    final_df=final_df,
+                    baseline=baseline,
+                    code_unification_report=code_unification_report,
+                    top_n=top_n,
+                    save_note=save_note,
+                )
+
+            except Exception as exc:
+                st.error(f"Error procesando archivos: {exc}")
+                st.info(
+                    "Revisa que cada archivo este cargado en su casillero correcto. "
+                    "La pestana Mudanza queda disponible aunque este analisis falle."
+                )
+
     with mudanza_tab:
+        # Si Pedido no se pudo calcular, Mudanza trabaja igual; en Frecuencia/ABC mostrara NO ESTA.
+        if not isinstance(final_df, pd.DataFrame) or final_df.empty:
+            final_df = pd.DataFrame(columns=["part_no", "description", "abc", "status"])
+
         render_mudanza_tab(
             empresa=empresa_activa,
             analysis_date=analysis_date,
             analysis_month=analysis_month,
             final_df=final_df,
-            default_inventory_file=inventario_file,
+            default_inventory_file=inventario_file_for_mudanza,
             default_note=save_note,
         )
-
 
 if __name__ == "__main__":
     main()
