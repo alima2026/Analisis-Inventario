@@ -1,4 +1,4 @@
-import hashlib
+﻿import hashlib
 import math
 import re
 import sqlite3
@@ -26,8 +26,8 @@ DEFAULT_COMPANY = "Magna"
 AUTO_ORDER_FOLDER = APP_DIR / "Pedidos Solicitados"
 DEPOSIT_LABELS = {
     "D012": "Darkinel Central",
-    "D122": "Pañol Darkinel",
-    "D0122": "Pañol Darkinel",
+    "D122": "PaÃ±ol Darkinel",
+    "D0122": "PaÃ±ol Darkinel",
 }
 MUDANZA_DESTINATIONS = ["Pendiente", "Arrieta", "Polo Logistico", "Darkinel", "Revisar"]
 EDITABLE_ORDER_SOURCE_TYPE = "pedido_editable_mazda"
@@ -51,14 +51,14 @@ def normalize_part(value) -> str:
 
 
 def _strip_scanner_suffix(value) -> str:
-    """Devuelve el código limpio cuando viene de lector/scanner.
+    """Devuelve el cÃ³digo limpio cuando viene de lector/scanner.
 
     Reglas:
     - KIA/Hyundai puede venir como: 865141W200        JJ15. Se toma 865141W200.
     - Mazda puede venir sin guiones: BCPV67UC5, DGV288110 02Y, DGK934700 E.
       Se toma el primer bloque real y luego se genera la clave Mazda 4-2-3.
     - Algunos lectores agregan coma, punto y coma o texto de lote. Se corta en el primer
-      separador claro y en el primer bloque útil.
+      separador claro y en el primer bloque Ãºtil.
     """
     if pd.isna(value):
         return ""
@@ -68,7 +68,7 @@ def _strip_scanner_suffix(value) -> str:
     if not text:
         return ""
 
-    # Si pegan varios códigos o el lector agrega separadores, trabajar con el primero.
+    # Si pegan varios cÃ³digos o el lector agrega separadores, trabajar con el primero.
     first_segment = re.split(r"[;,|]", text, maxsplit=1)[0].strip()
     tokens = [token.strip() for token in re.split(r"\s+", first_segment) if token.strip()]
     if not tokens:
@@ -77,7 +77,7 @@ def _strip_scanner_suffix(value) -> str:
     first = tokens[0]
     first_plain = re.sub(r"[^A-Z0-9]", "", first)
 
-    # Caso lector: código largo + sufijo corto de etiqueta/lote.
+    # Caso lector: cÃ³digo largo + sufijo corto de etiqueta/lote.
     # Ejemplos:
     #   865141W200 JJ15 -> 865141W200
     #   DGV288110 02Y   -> DGV288110
@@ -94,7 +94,7 @@ def _clean_part_text(value) -> str:
     text = _strip_scanner_suffix(value)
     text = text.replace("ASTERISCO", "*")
     text = re.sub(r"\s+", "", text)
-    # Mantener solo caracteres que pueden formar códigos de pieza.
+    # Mantener solo caracteres que pueden formar cÃ³digos de pieza.
     text = re.sub(r"[^A-Z0-9\-*()]", "", text)
     return text
 
@@ -179,7 +179,7 @@ def parse_part_code(value, allow_mazda_compact: bool = False) -> dict:
                 revision = core_compact[-1]
                 core_compact = core_compact[:-1]
 
-            # La clave de familia Mazda es 4-2-3. Lo que viene después es modificación/sufijo.
+            # La clave de familia Mazda es 4-2-3. Lo que viene despuÃ©s es modificaciÃ³n/sufijo.
             if len(core_compact) >= 9:
                 code_key = f"{core_compact[:4]}-{core_compact[4:6]}-{core_compact[6:9]}"
                 suffix = core_compact[9:]
@@ -214,7 +214,7 @@ def normalize_part_display(value, allow_mazda_compact: bool = False) -> str:
 
 
 def normalize_part_consulta_key(value) -> str:
-    """Clave de búsqueda por familia/base.
+    """Clave de bÃºsqueda por familia/base.
 
     Mazda:
     - B631-14-302 = B631-14-302A = B631-14-302C02
@@ -223,7 +223,7 @@ def normalize_part_consulta_key(value) -> str:
     - DGK934700 E = DGK9-34-700
 
     KIA/Hyundai y multimarca:
-    - Se compara el código limpio y, cuando viene de scanner, se toma el primer bloque útil.
+    - Se compara el cÃ³digo limpio y, cuando viene de scanner, se toma el primer bloque Ãºtil.
     """
     raw_text = _clean_part_text(value)
     if not raw_text:
@@ -241,7 +241,7 @@ def normalize_part_consulta_key(value) -> str:
     mazda_hyphen = re.fullmatch(r"([A-Z0-9]{4})-([A-Z0-9]{2})-([A-Z0-9]{3})([A-Z0-9]*)", text)
     if mazda_hyphen:
         group_1, group_2, group_3, _suffix = mazda_hyphen.groups()
-        # Evita transformar códigos puramente numéricos tipo KIA.
+        # Evita transformar cÃ³digos puramente numÃ©ricos tipo KIA.
         if re.search(r"[A-Z]", group_1):
             return f"{group_1}-{group_2}-{group_3}".upper()
 
@@ -260,7 +260,7 @@ def normalize_part_plain_key(value) -> str:
 
 
 def clean_consulta_input(value) -> dict:
-    """Limpia códigos ingresados a mano o por scanner.
+    """Limpia cÃ³digos ingresados a mano o por scanner.
 
     Casos cubiertos:
     - KIA/Hyundai: "865141W200        JJ15" => 865141W200.
@@ -268,7 +268,7 @@ def clean_consulta_input(value) -> dict:
     - Mazda scanner sin guion: "BCPV67UC5" => BCPV-67-UC5.
     - Mazda scanner con sufijo/lote: "DGV288110 02Y" => DGV2-88-110.
     - Mazda base con variantes: "B63114302C02" => B631-14-302.
-    - Multimarca: toma el primer bloque útil y prueba recortes razonables.
+    - Multimarca: toma el primer bloque Ãºtil y prueba recortes razonables.
     """
     if pd.isna(value):
         return {"raw": "", "main": "", "plain": "", "tokens": [], "candidates": []}
@@ -278,7 +278,7 @@ def clean_consulta_input(value) -> dict:
     if not raw_original:
         return {"raw": "", "main": "", "plain": "", "tokens": [], "candidates": []}
 
-    # Si el lector manda varios códigos o termina con separadores, analizar el primero.
+    # Si el lector manda varios cÃ³digos o termina con separadores, analizar el primero.
     raw = re.split(r"[;,|]", raw_original, maxsplit=1)[0].strip()
     tokens = [token.strip() for token in re.split(r"\s+", raw) if token.strip()]
     token_plain = [re.sub(r"[^A-Z0-9]", "", token) for token in tokens]
@@ -310,14 +310,14 @@ def clean_consulta_input(value) -> dict:
         add_candidate(mazda_base.replace("-", ""))
         add_candidate(plain[:9])
 
-    # KIA/Hyundai: normalmente el código útil tiene 10 u 11 caracteres.
+    # KIA/Hyundai: normalmente el cÃ³digo Ãºtil tiene 10 u 11 caracteres.
     # Si el lector trae lote pegado, probamos ambas variantes.
     if len(plain) >= 10 and re.match(r"^[0-9]", plain):
         add_candidate(plain[:10])
         if len(plain) >= 11:
             add_candidate(plain[:11])
 
-    # Multimarca y lectores genéricos: probar cortes habituales.
+    # Multimarca y lectores genÃ©ricos: probar cortes habituales.
     # No reemplaza la coincidencia exacta, solo suma sugerencias/alternativas.
     for size in (9, 10, 11, 14):
         if len(plain) >= size:
@@ -349,7 +349,7 @@ def build_consulta_candidate_keys(value) -> dict:
         if plain_key:
             plain_candidates.add(plain_key)
 
-        # Si es Mazda compactado/formateado, agregar explícitamente la familia base.
+        # Si es Mazda compactado/formateado, agregar explÃ­citamente la familia base.
         mazda_base = _format_mazda_compact_base(plain_key)
         if mazda_base:
             consulta_candidates.add(mazda_base)
@@ -366,7 +366,7 @@ def build_consulta_candidate_keys(value) -> dict:
 
 
 def choose_suggested_destination_for_row(row) -> tuple[str, str, str]:
-    """Sugiere depósito desde frecuencia + rubro + situación.
+    """Sugiere depÃ³sito desde frecuencia + rubro + situaciÃ³n.
 
     Devuelve: deposito_sugerido, rubro_sugerido, motivo.
     """
@@ -378,21 +378,21 @@ def choose_suggested_destination_for_row(row) -> tuple[str, str, str]:
     rubro = classify_mudanza_product_family(description, part_no) if "classify_mudanza_product_family" in globals() else "SIN_CLASIFICAR"
 
     if "AUDISTOCK" in situacion or "ARRIETA" in situacion:
-        return "Arrieta", rubro, "Figura como AUDISTOCK/ARRIETA en archivo de situación."
+        return "Arrieta", rubro, "Figura como AUDISTOCK/ARRIETA en archivo de situaciÃ³n."
 
     if frecuencia not in {"A", "B", "C"}:
-        return "Depósito Muerto", rubro, "No tiene frecuencia de venta A/B/C."
+        return "DepÃ³sito Muerto", rubro, "No tiene frecuencia de venta A/B/C."
 
     if rubro == "CARROCERIA":
-        return "Polo Logístico", rubro, "Tiene frecuencia de venta y la descripción corresponde a carrocería."
+        return "Polo LogÃ­stico", rubro, "Tiene frecuencia de venta y la descripciÃ³n corresponde a carrocerÃ­a."
 
     if rubro == "SERVICE":
-        return "Darkinel", rubro, "Tiene frecuencia de venta y la descripción corresponde a service/mantenimiento."
+        return "Darkinel", rubro, "Tiene frecuencia de venta y la descripciÃ³n corresponde a service/mantenimiento."
 
-    if destino_actual in {"Polo Logistico", "Polo Logístico", "Darkinel", "Arrieta"}:
+    if destino_actual in {"Polo Logistico", "Polo LogÃ­stico", "Darkinel", "Arrieta"}:
         return destino_actual, rubro, "Usa el destino ya calculado por Mudanza."
 
-    return "Revisar", rubro, "Tiene frecuencia, pero no se reconoció claramente carrocería o service."
+    return "Revisar", rubro, "Tiene frecuencia, pero no se reconociÃ³ claramente carrocerÃ­a o service."
 
 
 def choose_latest_part_code(values, allow_mazda_compact: bool = False) -> str:
@@ -653,7 +653,7 @@ def canonicalize_deposit_code(value) -> str:
         return ""
     if text in {"D0122", "D122"}:
         return "D122"
-    if any(marker in text for marker in ["PAÑOL", "PAÃ‘OL", "PANOL"]):
+    if any(marker in text for marker in ["PAÃ‘OL", "PAÃƒâ€˜OL", "PANOL"]):
         return "D122"
     if "D0122" in text:
         return "D122"
@@ -693,7 +693,7 @@ def join_unique_text(values, separator: str = " | ") -> str:
 
 
 def normalize_mudanza_situation(value) -> str:
-    """Normaliza la decisión operativa que viene del archivo Stock MUERTO_ARRIETA."""
+    """Normaliza la decisiÃ³n operativa que viene del archivo Stock MUERTO_ARRIETA."""
     text = safe_text(value).upper()
     if not text:
         return ""
@@ -723,7 +723,7 @@ def normalize_abc_frequency(value) -> str:
 def _normalize_for_keyword_search(value) -> str:
     text = safe_text(value).upper()
     replacements = {
-        "Á": "A", "É": "E", "Í": "I", "Ó": "O", "Ú": "U", "Ü": "U", "Ñ": "N",
+        "Ã": "A", "Ã‰": "E", "Ã": "I", "Ã“": "O", "Ãš": "U", "Ãœ": "U", "Ã‘": "N",
         "/": " ", "-": " ", ".": " ", ",": " ", "(": " ", ")": " ",
     }
     for source, target in replacements.items():
@@ -733,7 +733,7 @@ def _normalize_for_keyword_search(value) -> str:
 
 
 def classify_mudanza_product_family(description_value, part_no_value="") -> str:
-    """Clasifica SERVICE/CARROCERIA para decidir destino cuando el análisis A/B/C lo saca de muerto."""
+    """Clasifica SERVICE/CARROCERIA para decidir destino cuando el anÃ¡lisis A/B/C lo saca de muerto."""
     text = _normalize_for_keyword_search(f"{description_value} {part_no_value}")
     if not text:
         return "SIN_CLASIFICAR"
@@ -782,6 +782,8 @@ def build_mudanza_situation_label_with_abc(situation_value, frecuencia_value, de
     frecuencia = normalize_abc_frequency(frecuencia_value)
 
     if normalized == "ARRIETA":
+        if frecuencia:
+            return "POR FAVOR ANALIZAR - TIENE FRECUENCIA"
         return "DEVOLVER - ARRIETA"
 
     if normalized == "MUERTO":
@@ -805,6 +807,8 @@ def suggest_mudanza_destination(situation_label: str, current_destination: str =
     situation = safe_text(situation_label).upper()
     if situation == "DEVOLVER - ARRIETA":
         return "Arrieta"
+    if situation.startswith("POR FAVOR ANALIZAR"):
+        return "Revisar"
     if situation.startswith("FRECUENCIA ") and "CARROCERIA" in situation:
         return "Polo Logistico"
     if situation.startswith("FRECUENCIA ") and "SERVICE" in situation:
@@ -858,14 +862,14 @@ def classify_order_number(order_number: str) -> dict:
 
 def classify_transport_from_arrange(arrange: str, order_code: str = "") -> dict:
     arrange_text = safe_text(arrange).upper()
-    if arrange_text in {"AIR", "AEREO", "AÉREO"}:
+    if arrange_text in {"AIR", "AEREO", "AÃ‰REO"}:
         return {
             "order_code": normalize_order_number(order_code),
             "transport_type": "AEREO",
             "lead_time_days": 30,
             "label": "Aereo - demora estimada 30 dias",
         }
-    if arrange_text in {"SEA", "MARITIMO", "MARÍTIMO"}:
+    if arrange_text in {"SEA", "MARITIMO", "MARÃTIMO"}:
         return {
             "order_code": normalize_order_number(order_code),
             "transport_type": "MARITIMO",
@@ -1196,8 +1200,8 @@ def detect_inventory_deposit_from_raw(raw: pd.DataFrame, source_name: str = "") 
 
     if any(code in header_text for code in ["D0122", "D122"]) or any(code in source_text for code in ["D0122", "D122"]):
         return "D122"
-    if any(marker in header_text for marker in ["PAÑOL", "PANOL"]) or any(
-        marker in source_text for marker in ["PAÑOL", "PANOL"]
+    if any(marker in header_text for marker in ["PAÃ‘OL", "PANOL"]) or any(
+        marker in source_text for marker in ["PAÃ‘OL", "PANOL"]
     ):
         return "D122"
 
@@ -1270,10 +1274,10 @@ def empty_mudanza_items_df() -> pd.DataFrame:
     )
 
 def load_mudanza_inventory(uploaded_file, fallback_deposit_code: str = "") -> pd.DataFrame:
-    """Lee el inventario del depósito a analizar.
+    """Lee el inventario del depÃ³sito a analizar.
 
     Si se carga por error un archivo de ventas u otro formato, no rompe la app:
-    devuelve vacío y la pestaña Mudanza puede seguir mostrando lo que venga del
+    devuelve vacÃ­o y la pestaÃ±a Mudanza puede seguir mostrando lo que venga del
     archivo Stock MUERTO_ARRIETA.
     """
     if uploaded_file is None:
@@ -1371,13 +1375,13 @@ def load_mudanza_inventory(uploaded_file, fallback_deposit_code: str = "") -> pd
 def _normalize_column_label(value) -> str:
     text = safe_text(value).upper()
     replacements = {
-        "Á": "A",
-        "É": "E",
-        "Í": "I",
-        "Ó": "O",
-        "Ú": "U",
-        "Ü": "U",
-        "Ñ": "N",
+        "Ã": "A",
+        "Ã‰": "E",
+        "Ã": "I",
+        "Ã“": "O",
+        "Ãš": "U",
+        "Ãœ": "U",
+        "Ã‘": "N",
     }
     for source, target in replacements.items():
         text = text.replace(source, target)
@@ -1645,13 +1649,13 @@ def build_mudanza_dataset(
     status_df: Optional[pd.DataFrame] = None,
     saved_decisions_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    """Arma la pantalla de Mudanza/Separación.
+    """Arma la pantalla de Mudanza/SeparaciÃ³n.
 
     Base de trabajo:
-    - Inventario del depósito cargado, si existe.
-    - Artículos del archivo Stock MUERTO_ARRIETA con stock positivo, aunque no aparezcan en el inventario.
+    - Inventario del depÃ³sito cargado, si existe.
+    - ArtÃ­culos del archivo Stock MUERTO_ARRIETA con stock positivo, aunque no aparezcan en el inventario.
 
-    El cruce contra el análisis usa también la clave base Mazda 4-2-3 para que
+    El cruce contra el anÃ¡lisis usa tambiÃ©n la clave base Mazda 4-2-3 para que
     B631-14-302, B631-14-302A y B631-14-302C02 sean tratados como la misma familia.
     """
     valid_inventories = [frame.copy() for frame in inventory_frames if isinstance(frame, pd.DataFrame) and not frame.empty]
@@ -1679,7 +1683,7 @@ def build_mudanza_dataset(
             )
         )
 
-    # Agrega artículos que vienen en Stock MUERTO_ARRIETA aunque no estén en el inventario cargado.
+    # Agrega artÃ­culos que vienen en Stock MUERTO_ARRIETA aunque no estÃ©n en el inventario cargado.
     if status_df is not None and not status_df.empty:
         status_base = status_df.copy()
         status_base["stock_status"] = pd.to_numeric(status_base.get("stock_status", 0), errors="coerce").fillna(0.0)
@@ -1710,7 +1714,7 @@ def build_mudanza_dataset(
     if inventory_df.empty:
         return empty_mudanza_items_df()
 
-    # Lookup de análisis con clave exacta y clave base Mazda.
+    # Lookup de anÃ¡lisis con clave exacta y clave base Mazda.
     analysis_base = analysis_df.copy() if isinstance(analysis_df, pd.DataFrame) else pd.DataFrame()
     for required_col in ["part_no", "description", "abc", "status"]:
         if required_col not in analysis_base.columns:
@@ -4423,34 +4427,34 @@ def build_mudanza_export_df(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 def render_consultar_articulo_tab(analysis_month: str):
-    st.subheader("Consultar artículo")
+    st.subheader("Consultar artÃ­culo")
     st.caption(
-        "Ingresá o escaneá un código para ver si figura en Mudanza. La búsqueda compara exacto, sin guiones, "
-        "variantes Mazda por código base y lecturas de scanner. Ejemplos: 865141W200 JJ15, "
+        "IngresÃ¡ o escaneÃ¡ un cÃ³digo para ver si figura en Mudanza. La bÃºsqueda compara exacto, sin guiones, "
+        "variantes Mazda por cÃ³digo base y lecturas de scanner. Ejemplos: 865141W200 JJ15, "
         "B631-14-302 = B631-14-302A = B631-14-302C02."
     )
 
     mudanza_df = st.session_state.get(f"mudanza_df_{analysis_month}")
     if not isinstance(mudanza_df, pd.DataFrame) or mudanza_df.empty:
-        st.info("Todavía no hay datos de Mudanza cargados. Primero cargá la pestaña Mudanza.")
+        st.info("TodavÃ­a no hay datos de Mudanza cargados. Primero cargÃ¡ la pestaÃ±a Mudanza.")
         return
 
     with st.form(key=f"consulta_form_{analysis_month}"):
-        query = st.text_input("Código de artículo", placeholder="Ej: 865141W200 JJ15 o B631-14-302")
+        query = st.text_input("CÃ³digo de artÃ­culo", placeholder="Ej: 865141W200 JJ15 o B631-14-302")
         submitted = st.form_submit_button("Consultar", type="primary")
 
     if not submitted:
-        st.caption("Escribí el código y presioná Consultar. No busca mientras escribís, para que sea más rápido.")
+        st.caption("EscribÃ­ el cÃ³digo y presionÃ¡ Consultar. No busca mientras escribÃ­s, para que sea mÃ¡s rÃ¡pido.")
         return
 
     query_clean = safe_text(query)
     if not query_clean:
-        st.warning("Ingresá un código para buscar.")
+        st.warning("IngresÃ¡ un cÃ³digo para buscar.")
         return
 
     query_for_search = _strip_scanner_suffix(query_clean)
     if query_for_search != query_clean:
-        st.caption(f"Lectura de scanner detectada. Se buscará el código base: {query_for_search}")
+        st.caption(f"Lectura de scanner detectada. Se buscarÃ¡ el cÃ³digo base: {query_for_search}")
 
     query_key = normalize_part_key(query_for_search, allow_mazda_compact=True).upper()
     query_consulta_key = normalize_part_consulta_key(query_for_search).upper()
@@ -4483,17 +4487,17 @@ def render_consultar_articulo_tab(analysis_month: str):
         partial = False
 
     if matches.empty:
-        st.error(f"No encontré el artículo {query_for_search} en la base actual de Mudanza.")
-        st.caption("Revisá guiones, letra final, variantes Mazda o que el archivo correcto esté cargado.")
+        st.error(f"No encontrÃ© el artÃ­culo {query_for_search} en la base actual de Mudanza.")
+        st.caption("RevisÃ¡ guiones, letra final, variantes Mazda o que el archivo correcto estÃ© cargado.")
         return
 
     if partial:
         st.warning("No hubo coincidencia exacta. Muestro coincidencias parciales.")
     else:
-        st.success(f"Artículo encontrado. Clave base: {query_consulta_key or query_key}")
+        st.success(f"ArtÃ­culo encontrado. Clave base: {query_consulta_key or query_key}")
 
     metric_1, metric_2, metric_3 = st.columns(3)
-    metric_1.metric("Líneas encontradas", f"{len(matches):,}")
+    metric_1.metric("LÃ­neas encontradas", f"{len(matches):,}")
     metric_2.metric("Unidades", f"{float(pd.to_numeric(matches['stock'], errors='coerce').fillna(0).sum()):,.0f}")
     metric_3.metric("Destinos", f"{matches['destino_mudanza'].nunique():,}")
 
@@ -4516,15 +4520,15 @@ def render_consultar_articulo_tab(analysis_month: str):
     st.dataframe(
         matches[display_cols].rename(
             columns={
-                "deposit_name": "depósito/fuente",
-                "part_no": "código",
-                "description": "descripción",
+                "deposit_name": "depÃ³sito/fuente",
+                "part_no": "cÃ³digo",
+                "description": "descripciÃ³n",
                 "stock": "cantidad",
                 "stock_archivo_situacion": "cant. archivo",
                 "frecuencia_abc": "frecuencia",
-                "situacion_articulo": "situación",
+                "situacion_articulo": "situaciÃ³n",
                 "destino_mudanza": "destino",
-                "ubicacion": "ubicación",
+                "ubicacion": "ubicaciÃ³n",
             }
         ),
         use_container_width=True,
@@ -4543,17 +4547,17 @@ def render_mudanza_tab(
     render_mudanza_feedback()
     st.subheader("Mudanza")
     st.caption(
-        "Analiza el stock del depósito cargado, cruza ABC y situación del artículo, "
-        "y propone si cada pieza va a Arrieta, Polo Logístico o Darkinel."
+        "Analiza el stock del depÃ³sito cargado, cruza ABC y situaciÃ³n del artÃ­culo, "
+        "y propone si cada pieza va a Arrieta, Polo LogÃ­stico o Darkinel."
     )
 
     inventory_upload = st.file_uploader(
-        "Inventario del depósito a analizar",
+        "Inventario del depÃ³sito a analizar",
         type=["xls", "xlsx"],
         key=f"mudanza_inventory_deposito_{analysis_month}",
     )
     status_upload = st.file_uploader(
-        "Archivo situación artículos (Stock MUERTO_ARRIETA / Audistock / Muerto / Arrieta)",
+        "Archivo situaciÃ³n artÃ­culos (Stock MUERTO_ARRIETA / Audistock / Muerto / Arrieta)",
         type=["xlsx"],
         key=f"mudanza_status_{analysis_month}",
     )
@@ -4565,11 +4569,11 @@ def render_mudanza_tab(
         pd.DataFrame(
             [
                 {
-                    "fuente": "Inventario del depósito a analizar",
+                    "fuente": "Inventario del depÃ³sito a analizar",
                     "archivo": inventory_file.name if inventory_file is not None else "No cargado",
                 },
                 {
-                    "fuente": "Situación artículos",
+                    "fuente": "SituaciÃ³n artÃ­culos",
                     "archivo": status_file.name if status_file is not None else "No cargado",
                 },
             ]
@@ -4578,8 +4582,8 @@ def render_mudanza_tab(
         hide_index=True,
     )
     st.caption(
-        "Regla: AUDISTOCK se separa para Arrieta. Si dice STOCK MUERTO pero el análisis da frecuencia A/B/C, "
-        "se saca de muerto y se clasifica: CARROCERÍA va al Polo Logístico; SERVICE queda en Darkinel. "
+        "Regla: AUDISTOCK se separa para Arrieta, salvo que el analisis indique frecuencia A/B/C: ahi queda como POR FAVOR ANALIZAR. Si dice STOCK MUERTO pero el analisis indica frecuencia A/B/C, "
+        "se saca de muerto y se clasifica: CARROCERÃA va al Polo LogÃ­stico; SERVICE queda en Darkinel. "
         "Si dice STOCK MUERTO y no tiene frecuencia A/B/C, queda como APARTAR - STOCK MUERTO PARA DEVOLVER."
     )
 
@@ -4591,7 +4595,7 @@ def render_mudanza_tab(
             if inv_df.empty:
                 inventory_warning = (
                     "El archivo cargado como inventario no parece tener el formato de inventario esperado. "
-                    "La app igual mostrará los artículos del archivo de situación si están cargados."
+                    "La app igual mostrarÃ¡ los artÃ­culos del archivo de situaciÃ³n si estÃ¡n cargados."
                 )
             else:
                 inventory_frames.append(inv_df)
@@ -4605,7 +4609,7 @@ def render_mudanza_tab(
         )
         st.session_state[f"mudanza_df_{analysis_month}"] = mudanza_df.copy()
     except Exception as exc:
-        st.error(f"No se pudo preparar la pestaña de mudanza: {exc}")
+        st.error(f"No se pudo preparar la pestaÃ±a de mudanza: {exc}")
         return
 
     if inventory_warning:
@@ -4613,15 +4617,15 @@ def render_mudanza_tab(
 
     if mudanza_df.empty:
         st.info(
-            "Carga el archivo de situación Stock MUERTO_ARRIETA y/o el inventario del depósito a analizar. "
-            "Con el archivo de situación alcanza para listar AUDISTOCK y STOCK MUERTO."
+            "Carga el archivo de situaciÃ³n Stock MUERTO_ARRIETA y/o el inventario del depÃ³sito a analizar. "
+            "Con el archivo de situaciÃ³n alcanza para listar AUDISTOCK y STOCK MUERTO."
         )
         return
 
     metric_1, metric_2, metric_3, metric_4, metric_5 = st.columns(5)
-    metric_1.metric("Artículos", f"{len(mudanza_df):,}")
+    metric_1.metric("ArtÃ­culos", f"{len(mudanza_df):,}")
     metric_2.metric("Unid. inventario/app", f"{float(mudanza_df['stock'].sum()):,.0f}")
-    metric_3.metric("Unid. archivo situación", f"{float(pd.to_numeric(mudanza_df.get('stock_archivo_situacion', 0), errors='coerce').fillna(0).sum()):,.0f}")
+    metric_3.metric("Unid. archivo situaciÃ³n", f"{float(pd.to_numeric(mudanza_df.get('stock_archivo_situacion', 0), errors='coerce').fillna(0).sum()):,.0f}")
     metric_4.metric("Con ABC A/B/C", f"{int(mudanza_df['frecuencia_abc'].isin(['A', 'B', 'C']).sum()):,}")
     metric_5.metric("Diferencias stock", f"{int(mudanza_df['control_stock'].astype(str).str.contains('DIFERENCIA', na=False).sum()):,}")
 
@@ -4634,7 +4638,7 @@ def render_mudanza_tab(
         use_container_width=True,
         hide_index=True,
     )
-    summary_col_2.caption("Resumen por situación")
+    summary_col_2.caption("Resumen por situaciÃ³n")
     summary_col_2.dataframe(
         mudanza_df.groupby("situacion_articulo", as_index=False)
         .agg(
@@ -4669,14 +4673,14 @@ def render_mudanza_tab(
                 ]
             ].rename(
                 columns={
-                    "part_no": "código",
-                    "description": "descripción",
+                    "part_no": "cÃ³digo",
+                    "description": "descripciÃ³n",
                     "stock": "cantidad",
                     "stock_archivo_situacion": "cant. archivo",
                     "frecuencia_abc": "frecuencia",
-                    "situacion_articulo": "situación",
+                    "situacion_articulo": "situaciÃ³n",
                     "destino_mudanza": "destino",
-                    "ubicacion": "ubicación",
+                    "ubicacion": "ubicaciÃ³n",
                 }
             ),
             use_container_width=True,
@@ -4687,12 +4691,12 @@ def render_mudanza_tab(
     show_subset(
         "Audistock / Arrieta",
         mudanza_df["situacion_articulo"].astype(str).str.upper().eq("DEVOLVER - ARRIETA"),
-        "No hay artículos AUDISTOCK/ARRIETA en esta corrida.",
+        "No hay artÃ­culos AUDISTOCK/ARRIETA en esta corrida.",
     )
     show_subset(
         "Stock muerto que se saca de muerto por frecuencia A/B/C",
         mudanza_df["situacion_articulo"].astype(str).str.upper().str.startswith("FRECUENCIA "),
-        "No hay artículos STOCK MUERTO con frecuencia A/B/C en esta corrida.",
+        "No hay artÃ­culos STOCK MUERTO con frecuencia A/B/C en esta corrida.",
     )
 
     st.caption("Control de cantidades: compara stock inventario contra stock del archivo Stock MUERTO_ARRIETA.")
@@ -4709,21 +4713,21 @@ def render_mudanza_tab(
         hide_index=True,
     )
 
-    st.caption("Define o corrige el destino para cada artículo. Si ya había una decisión guardada, se precarga automáticamente.")
+    st.caption("Define o corrige el destino para cada artÃ­culo. Si ya habÃ­a una decisiÃ³n guardada, se precarga automÃ¡ticamente.")
     editor_source_df = mudanza_df.reset_index(drop=True).copy()
     editor_display_df = pd.DataFrame(
         {
-            "Depósito/Fuente": editor_source_df["deposit_name"],
-            "Código": editor_source_df["part_no"],
+            "DepÃ³sito/Fuente": editor_source_df["deposit_name"],
+            "CÃ³digo": editor_source_df["part_no"],
             "Nombre": editor_source_df["description"],
             "Cant. inventario/app": editor_source_df["stock"],
             "Cant. archivo": editor_source_df["stock_archivo_situacion"],
             "Dif. stock": editor_source_df["diferencia_stock"],
             "Control stock": editor_source_df["control_stock"],
-            "Ubicación": editor_source_df["ubicacion"],
-            "Locación NODUM": editor_source_df["locacion_nodum"],
+            "UbicaciÃ³n": editor_source_df["ubicacion"],
+            "LocaciÃ³n NODUM": editor_source_df["locacion_nodum"],
             "Frecuencia": editor_source_df["frecuencia_abc"],
-            "Situación": editor_source_df["situacion_articulo"],
+            "SituaciÃ³n": editor_source_df["situacion_articulo"],
             "Destino": editor_source_df["destino_mudanza"],
         }
     )
@@ -4740,17 +4744,17 @@ def render_mudanza_tab(
             "Destino": st.column_config.SelectboxColumn("Destino", options=MUDANZA_DESTINATIONS, required=True),
         },
         disabled=[
-            "Depósito/Fuente",
-            "Código",
+            "DepÃ³sito/Fuente",
+            "CÃ³digo",
             "Nombre",
             "Cant. inventario/app",
             "Cant. archivo",
             "Dif. stock",
             "Control stock",
-            "Ubicación",
-            "Locación NODUM",
+            "UbicaciÃ³n",
+            "LocaciÃ³n NODUM",
             "Frecuencia",
-            "Situación",
+            "SituaciÃ³n",
         ],
     )
 
@@ -4781,7 +4785,7 @@ def render_mudanza_tab(
             st.session_state["mudanza_feedback"] = feedback
             st.rerun()
     with save_col_2:
-        st.caption("Guarda la corrida para conservar las decisiones de destino y reutilizarlas en próximas cargas.")
+        st.caption("Guarda la corrida para conservar las decisiones de destino y reutilizarlas en prÃ³ximas cargas.")
 
     recent_runs = load_recent_mudanza_runs(empresa)
     if not recent_runs.empty:
@@ -5560,7 +5564,7 @@ def main():
     final_df = pd.DataFrame(columns=["part_no", "description", "abc", "status"])
     inventario_file_for_mudanza = detected_sources.get("inventario")
 
-    pedido_tab, mudanza_tab, consulta_tab = st.tabs(["Pedido", "Mudanza", "Consultar artículo"])
+    pedido_tab, mudanza_tab, consulta_tab = st.tabs(["Pedido", "Mudanza", "Consultar artÃ­culo"])
 
     with pedido_tab:
         st.info(
@@ -5808,3 +5812,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
